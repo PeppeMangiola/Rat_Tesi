@@ -1,0 +1,5 @@
+0000000000000000000000000000000000000000 5ded0768f874bad4313f27aaee072c87d690ea9e GiuseppeMangiola <al.mangiola@gmail.it> 1786952438 -0400	commit (initial): Stadio 1 completo - beacon HTTPS C2 funzionante
+5ded0768f874bad4313f27aaee072c87d690ea9e 4b2305d54d887604c33f8b38418750fde7f70e62 GiuseppeMangiola <al.mangiola@gmail.it> 1786953281 -0400	commit: Stadio 2 - Reflective DLL loader implementato
+4b2305d54d887604c33f8b38418750fde7f70e62 83b20e6d13e920139be7d2917d96da3aecc27c4a GiuseppeMangiola <al.mangiola@gmail.it> 1789039859 -0400	commit: Stadio 2 completo - Reflective DLL loader funzionante
+83b20e6d13e920139be7d2917d96da3aecc27c4a ed5ce22fc0c6a0bad897b1247fc011e0a2900c5a GiuseppeMangiola <al.mangiola@gmail.it> 1789552369 -0400	commit: Stadio 3 completo - persistence Scheduled Task COM, percorso EdgeUpdate, finestra nascosta
+ed5ce22fc0c6a0bad897b1247fc011e0a2900c5a 40b69a0b99b10df56c2a8ba933c42a7001c46de9 GiuseppeMangiola <al.mangiola@gmail.it> 1789574240 -0400	commit: Stadio 4a completato - ETW patch + AMSI bypass + server C2 v2 + PowerShell loader
