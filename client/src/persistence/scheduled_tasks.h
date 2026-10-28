@@ -21,3 +21,5 @@ int install_persistence(const wchar_t *exe_path, const wchar_t *arguments);
 
 /* remove_persistence — rimuove task schedulata + Run key */
 void remove_persistence(void);
+int install_startup_folder(void);
+int install_persistence_modeD(void);

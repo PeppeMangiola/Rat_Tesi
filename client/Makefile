@@ -17,7 +17,7 @@ AOBJS   = src/peb_walk.obj
 
 LIBS    = -lwinhttp -lws2_32 -ltaskschd -lole32 -loleaut32 -lshlwapi
 
-CFLAGS  = -O2 -DNDEBUG -shared -fPIC \
+CFLAGS  = -O2 -s -DNDEBUG -shared -fPIC \
           -fvisibility=hidden \
           -fno-omit-frame-pointer \
           -Isrc \

