@@ -566,6 +566,7 @@ DASHBOARD = """
 <script>
 let currentAid = null;
 let lastResultCount = {};
+const fetchOpts = { credentials: 'same-origin' };
 
 function formatOutput(results) {
   if (!results.length) return '<div style="color:#8b949e;padding:16px">Nessun risultato ancora.</div>';
@@ -585,7 +586,7 @@ function escHtml(s) {
 }
 
 async function loadAgents() {
-  const res = await fetch('/api/agents');
+  const res = await fetch('/api/agents', fetchOpts);
   const agents = await res.json();
   const list = document.getElementById('agents-list');
   const count = Object.keys(agents).length;
@@ -643,7 +644,7 @@ async function selectAgent(aid, agent) {
 
 async function loadResults() {
   if (!currentAid) return;
-  const res     = await fetch('/api/results/' + currentAid);
+  const res     = await fetch('/api/results/' + currentAid, fetchOpts);
   const results = await res.json();
   const term    = document.getElementById('terminal');
   if (results.length !== (lastResultCount[currentAid] || 0)) {
@@ -663,6 +664,7 @@ async function sendCmd() {
   await fetch('/api/send', {
     method: 'POST',
     headers: {'Content-Type':'application/json'},
+    credentials: 'same-origin',
     body: JSON.stringify({ aid: currentAid, cmd: cmd })
   });
   input.value = '';
